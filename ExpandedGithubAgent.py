@@ -138,13 +138,10 @@ COMMENT_DENSITY_WEIGHT = 0.1
 INTENT_SIMILARITY_WEIGHT = 0.6
 CODE_SIMILARITY_WEIGHT = 0.3
 GRAPH_PROXIMITY_WEIGHT = 0.1
-
-# Retrieval weighting configuration
-COMMENT_MATCH_WEIGHT = 0.2
-COMMENT_DENSITY_WEIGHT = 0.1
-INTENT_SIMILARITY_WEIGHT = 0.6
-CODE_SIMILARITY_WEIGHT = 0.3
-GRAPH_PROXIMITY_WEIGHT = 0.1
+CENTRALITY_WEIGHT = 0.2
+BM25_WEIGHT = 0.3
+EMBEDDING_WEIGHT = 0.5
+CONTEXT_COMPRESSION_TRIGGER_TOKENS = 22000
 
 # Cache Configuration
 TENANT_ID = os.getenv("GITHUB_AGENT_TENANT", "default_tenant")
@@ -295,6 +292,64 @@ def _comment_keyword_overlap_score(query: str, comment_text: str) -> float:
     overlap = q_tokens.intersection(c_tokens)
     return len(overlap) / len(q_tokens)
 
+
+
+
+def _tokenize_for_sparse(text: str) -> List[str]:
+    return re.findall(r"[a-zA-Z_][a-zA-Z0-9_]{1,}", (text or "").lower())
+
+
+def _extract_external_lib_from_import(import_stmt: str) -> Optional[str]:
+    """Extract external library/module root from common import syntaxes."""
+    stmt = (import_stmt or "").strip()
+    py_from = re.search(r"from\s+([\w\.]+)\s+import", stmt)
+    if py_from:
+        return py_from.group(1).split('.')[0]
+    py_imp = re.search(r"import\s+([\w\.]+)", stmt)
+    if py_imp:
+        return py_imp.group(1).split('.')[0]
+    js_from = re.search(r"from\s+[\"']([^\"']+)[\"']", stmt)
+    if js_from:
+        mod = js_from.group(1)
+        if not mod.startswith('.'):
+            return mod.split('/')[0]
+    req = re.search(r"require\s*\(\s*[\"']([^\"']+)[\"']\s*\)", stmt)
+    if req:
+        mod = req.group(1)
+        if not mod.startswith('.'):
+            return mod.split('/')[0]
+    return None
+
+
+def _comment_contextual_boost(query: str, comment_text: str) -> float:
+    """Contextual boost for domain-specific explanatory comments."""
+    if not query or not comment_text:
+        return 0.0
+    q = query.lower()
+    c = comment_text.lower()
+    domain_terms = ["auth", "payment", "cache", "db", "database", "queue", "token", "session", "validator"]
+    boost = 0.0
+    for t in domain_terms:
+        if t in q and t in c:
+            boost += 0.05
+    if "example" in c or "e.g." in c or "for example" in c:
+        boost += 0.05
+    if "generated" in c or "auto-generated" in c:
+        boost -= 0.05
+    return max(-0.1, min(boost, 0.2))
+
+
+def _compute_node_content_hash(node: Dict[str, Any]) -> str:
+    base = "|".join([
+        str(node.get('type', '')),
+        str(node.get('file', '')),
+        str(node.get('code', '')),
+        str(node.get('docstring', '')),
+        str(node.get('comments_above', '')),
+        str(node.get('arg_types', [])),
+        str(node.get('return_type', '')),
+    ])
+    return hashlib.md5(base.encode('utf-8', errors='ignore')).hexdigest()
 
 def _comment_quality_score(docstring: str, comments: str) -> float:
     """Estimate documentation quality beyond raw density."""
@@ -967,15 +1022,73 @@ class TreeSitterParser:
             "comment_quality": comment_quality
         }
 
+    def _extract_semantic_metadata_from_node(self, node, content: str) -> Dict[str, Any]:
+        """Language-agnostic semantic metadata extractor using tree-sitter fields."""
+        meta = {
+            "arg_names": [],
+            "arg_types": [],
+            "return_type": None,
+            "variable_mentions": [],
+            "exception_types": [],
+            "decorators": []
+        }
+
+        params = node.child_by_field_name('parameters')
+        if params:
+            for child in params.children:
+                if child.type in ['identifier', 'required_parameter', 'optional_parameter', 'parameter_declaration', 'formal_parameter']:
+                    name_node = child.child_by_field_name('name')
+                    if name_node:
+                        meta['arg_names'].append(self._get_text(name_node, content))
+                    type_node = child.child_by_field_name('type')
+                    if type_node:
+                        meta['arg_types'].append(self._get_text(type_node, content))
+
+        ret = node.child_by_field_name('return_type')
+        if ret:
+            meta['return_type'] = self._get_text(ret, content)
+
+        vars_seen, exc_seen = set(), set()
+        def walk(n):
+            if n.type in ['identifier', 'type_identifier']:
+                vars_seen.add(self._get_text(n, content))
+            if n.type in ['throw_statement', 'except_clause', 'catch_clause']:
+                exc_seen.add(n.type)
+            for c in n.children:
+                walk(c)
+        walk(node)
+        meta['variable_mentions'] = sorted(vars_seen)[:50]
+        meta['exception_types'] = sorted(exc_seen)
+        return meta
+
+    def _extract_python_bases(self, class_node, content: str) -> List[str]:
+        bases = []
+        sup = class_node.child_by_field_name('superclasses')
+        if sup:
+            for ch in sup.children:
+                if ch.type in ['identifier', 'attribute']:
+                    bases.append(self._get_text(ch, content).split('.')[-1])
+        return list(dict.fromkeys(bases))
+
+    def _extract_class_bases_generic(self, class_node, content: str) -> List[str]:
+        bases = []
+        for field_name in ['superclass', 'interfaces', 'extends_clause', 'implements_clause']:
+            n = class_node.child_by_field_name(field_name)
+            if n:
+                for ch in n.children:
+                    if ch.type in ['identifier', 'type_identifier', 'scoped_identifier']:
+                        bases.append(self._get_text(ch, content).split('.')[-1])
+        return list(dict.fromkeys(bases))
+
     def _extract_python(self, root, content: str) -> Dict[str, Any]:
         """Extract Python symbols."""
         nodes = []
         imports = []
-        
+
         def visit(node, namespace=""):
-            if node.type == 'import_statement' or node.type == 'import_from_statement':
+            if node.type in ['import_statement', 'import_from_statement']:
                 imports.append(self._get_text(node, content))
-            
+
             elif node.type == 'function_definition':
                 func_name_node = node.child_by_field_name('name')
                 if func_name_node:
@@ -987,7 +1100,7 @@ class TreeSitterParser:
                     api_calls = self._extract_api_calls(code)
                     comment_meta = self._extract_symbol_docs(node, content, code, 'python')
                     semantic_meta = _extract_python_semantic_metadata(code)
-                    
+
                     nodes.append({
                         "name": full_name,
                         "type": "function",
@@ -995,22 +1108,42 @@ class TreeSitterParser:
                         "calls": calls,
                         "api_route": api_route,
                         "api_outbound": api_calls,
+                        "bases": [],
                         **comment_meta,
                         **semantic_meta
                     })
-            
+
             elif node.type == 'class_definition':
                 class_name_node = node.child_by_field_name('name')
                 if class_name_node:
                     class_name = self._get_text(class_name_node, content)
-                    new_namespace = f"{namespace}.{class_name}" if namespace else class_name
+                    full_name = f"{namespace}.{class_name}" if namespace else class_name
+                    bases = self._extract_python_bases(node, content)
+                    class_code = self._get_text(node, content)
+                    comment_meta = self._extract_symbol_docs(node, content, class_code, 'python')
+                    nodes.append({
+                        "name": full_name,
+                        "type": "class",
+                        "code": class_code,
+                        "calls": [],
+                        "api_route": None,
+                        "api_outbound": [],
+                        "bases": bases,
+                        **comment_meta,
+                        "arg_names": [],
+                        "arg_types": [],
+                        "return_type": None,
+                        "variable_mentions": [],
+                        "exception_types": [],
+                        "decorators": []
+                    })
                     for child in node.children:
-                        visit(child, new_namespace)
+                        visit(child, full_name)
                     return
-            
+
             for child in node.children:
                 visit(child, namespace)
-        
+
         visit(root)
         return {"nodes": nodes, "imports": imports, "globals": "\n".join(imports)}
 
@@ -1051,11 +1184,11 @@ class TreeSitterParser:
         """Extract JavaScript/TypeScript symbols."""
         nodes = []
         imports = []
-        
+
         def visit(node, namespace=""):
             if node.type in ['import_statement', 'import_clause']:
                 imports.append(self._get_text(node, content))
-            
+
             elif node.type == 'function_declaration':
                 name_node = node.child_by_field_name('name')
                 if name_node:
@@ -1063,8 +1196,8 @@ class TreeSitterParser:
                     code = self._get_text(node, content)
                     calls = self._extract_calls_js(node, content)
                     api_calls = self._extract_api_calls(code)
-                    comment_meta = self._extract_symbol_docs(node, content, code, 'other')
-                    
+                    comment_meta = self._extract_symbol_docs(node, content, code, 'javascript')
+                    semantic_meta = self._extract_semantic_metadata_from_node(node, content)
                     nodes.append({
                         "name": name,
                         "type": "function",
@@ -1072,36 +1205,54 @@ class TreeSitterParser:
                         "calls": calls,
                         "api_route": None,
                         "api_outbound": api_calls,
-                        **comment_meta
+                        "bases": [],
+                        **comment_meta,
+                        **semantic_meta
                     })
-            
+
             elif node.type == 'lexical_declaration':
                 for child in node.children:
                     if child.type == 'variable_declarator':
                         name_node = child.child_by_field_name('name')
                         value_node = child.child_by_field_name('value')
-                        if name_node and value_node:
-                            if value_node.type in ['arrow_function', 'function']:
-                                name = self._get_text(name_node, content)
-                                code = self._get_text(child, content)
-                                calls = self._extract_calls_js(value_node, content)
-                                api_calls = self._extract_api_calls(code)
-                                comment_meta = self._extract_symbol_docs(child, content, code, 'javascript')
-                                
-                                nodes.append({
-                                    "name": name,
-                                    "type": "function",
-                                    "code": code,
-                                    "calls": calls,
-                                    "api_route": None,
-                                    "api_outbound": api_calls,
-                                    **comment_meta
-                                })
-            
+                        if name_node and value_node and value_node.type in ['arrow_function', 'function']:
+                            name = self._get_text(name_node, content)
+                            code = self._get_text(child, content)
+                            calls = self._extract_calls_js(value_node, content)
+                            api_calls = self._extract_api_calls(code)
+                            comment_meta = self._extract_symbol_docs(child, content, code, 'javascript')
+                            semantic_meta = self._extract_semantic_metadata_from_node(value_node, content)
+                            nodes.append({
+                                "name": name,
+                                "type": "function",
+                                "code": code,
+                                "calls": calls,
+                                "api_route": None,
+                                "api_outbound": api_calls,
+                                "bases": [],
+                                **comment_meta,
+                                **semantic_meta
+                            })
+
             elif node.type == 'class_declaration':
                 name_node = node.child_by_field_name('name')
                 if name_node:
                     class_name = self._get_text(name_node, content)
+                    bases = self._extract_class_bases_generic(node, content)
+                    class_code = self._get_text(node, content)
+                    comment_meta = self._extract_symbol_docs(node, content, class_code, 'javascript')
+                    nodes.append({
+                        "name": class_name,
+                        "type": "class",
+                        "code": class_code,
+                        "calls": [],
+                        "api_route": None,
+                        "api_outbound": [],
+                        "bases": bases,
+                        **comment_meta,
+                        "arg_names": [], "arg_types": [], "return_type": None,
+                        "variable_mentions": [], "exception_types": [], "decorators": []
+                    })
                     body = node.child_by_field_name('body')
                     if body:
                         for child in body.children:
@@ -1113,19 +1264,23 @@ class TreeSitterParser:
                                     code = self._get_text(child, content)
                                     calls = self._extract_calls_js(child, content)
                                     api_calls = self._extract_api_calls(code)
-                                    
+                                    comment_meta = self._extract_symbol_docs(child, content, code, 'javascript')
+                                    semantic_meta = self._extract_semantic_metadata_from_node(child, content)
                                     nodes.append({
                                         "name": full_name,
                                         "type": "method",
                                         "code": code,
                                         "calls": calls,
                                         "api_route": None,
-                                        "api_outbound": api_calls
+                                        "api_outbound": api_calls,
+                                        "bases": [],
+                                        **comment_meta,
+                                        **semantic_meta
                                     })
-            
+
             for child in node.children:
                 visit(child, namespace)
-        
+
         visit(root)
         return {"nodes": nodes, "imports": imports, "globals": "\n".join(imports)}
 
@@ -1154,11 +1309,11 @@ class TreeSitterParser:
         """Extract Java symbols."""
         nodes = []
         imports = []
-        
+
         def visit(node, class_context=""):
             if node.type == 'import_declaration':
                 imports.append(self._get_text(node, content))
-            
+
             elif node.type == 'method_declaration':
                 name_node = node.child_by_field_name('name')
                 if name_node:
@@ -1168,29 +1323,48 @@ class TreeSitterParser:
                     calls = self._extract_calls_java(node, content)
                     api_route = self._extract_spring_route(node, content)
                     api_calls = self._extract_api_calls(code)
-                    
+                    comment_meta = self._extract_symbol_docs(node, content, code, 'other')
+                    semantic_meta = self._extract_semantic_metadata_from_node(node, content)
                     nodes.append({
                         "name": full_name,
                         "type": "method",
                         "code": code,
                         "calls": calls,
                         "api_route": api_route,
-                        "api_outbound": api_calls
+                        "api_outbound": api_calls,
+                        "bases": [],
+                        **comment_meta,
+                        **semantic_meta
                     })
-            
+
             elif node.type == 'class_declaration':
                 name_node = node.child_by_field_name('name')
                 if name_node:
                     class_name = self._get_text(name_node, content)
+                    bases = self._extract_class_bases_generic(node, content)
+                    class_code = self._get_text(node, content)
+                    comment_meta = self._extract_symbol_docs(node, content, class_code, 'other')
+                    nodes.append({
+                        "name": class_name,
+                        "type": "class",
+                        "code": class_code,
+                        "calls": [],
+                        "api_route": None,
+                        "api_outbound": [],
+                        "bases": bases,
+                        **comment_meta,
+                        "arg_names": [], "arg_types": [], "return_type": None,
+                        "variable_mentions": [], "exception_types": [], "decorators": []
+                    })
                     body = node.child_by_field_name('body')
                     if body:
                         for child in body.children:
                             visit(child, class_name)
                     return
-            
+
             for child in node.children:
                 visit(child, class_context)
-        
+
         visit(root)
         return {"nodes": nodes, "imports": imports, "globals": "\n".join(imports)}
 
@@ -1231,11 +1405,11 @@ class TreeSitterParser:
         """Extract Go symbols."""
         nodes = []
         imports = []
-        
+
         def visit(node):
             if node.type == 'import_declaration':
                 imports.append(self._get_text(node, content))
-            
+
             elif node.type == 'function_declaration':
                 name_node = node.child_by_field_name('name')
                 if name_node:
@@ -1244,7 +1418,7 @@ class TreeSitterParser:
                     calls = self._extract_calls_go(node, content)
                     api_calls = self._extract_api_calls(code)
                     comment_meta = self._extract_symbol_docs(node, content, code, 'other')
-                    
+                    semantic_meta = self._extract_semantic_metadata_from_node(node, content)
                     nodes.append({
                         "name": name,
                         "type": "function",
@@ -1252,12 +1426,14 @@ class TreeSitterParser:
                         "calls": calls,
                         "api_route": None,
                         "api_outbound": api_calls,
-                        **comment_meta
+                        "bases": [],
+                        **comment_meta,
+                        **semantic_meta
                     })
-            
+
             for child in node.children:
                 visit(child)
-        
+
         visit(root)
         return {"nodes": nodes, "imports": imports, "globals": "\n".join(imports)}
 
@@ -1768,38 +1944,89 @@ class ImportResolver:
 # --- 4. Vector Embedding System ---
 
 class VectorEmbeddingStore:
-    """Stores and searches function embeddings using FAISS."""
-    
+    """Stores and searches function embeddings using FAISS + sparse hybrid scoring."""
+
     def __init__(self, dimension=1536):
         self.dimension = dimension
         self.intent_index = None
         self.code_index = None
+        self.structure_index = None
         self.node_ids = []
         self.node_metadata = {}
         self.last_scores = {}
-        
+
+        # Sparse retrieval state (BM25-like)
+        self.doc_term_freqs = []
+        self.doc_lengths = []
+        self.df = defaultdict(int)
+        self.avg_doc_len = 1.0
+
         if HAS_FAISS:
             self.intent_index = faiss.IndexFlatIP(dimension)
             self.code_index = faiss.IndexFlatIP(dimension)
-    
+            self.structure_index = faiss.IndexFlatIP(dimension)
+
+    def _build_sparse_index(self, texts: List[str]):
+        self.doc_term_freqs = []
+        self.doc_lengths = []
+        self.df = defaultdict(int)
+
+        for text in texts:
+            toks = _tokenize_for_sparse(text)
+            tf = defaultdict(int)
+            for t in toks:
+                tf[t] += 1
+            self.doc_term_freqs.append(dict(tf))
+            self.doc_lengths.append(len(toks))
+            for t in set(toks):
+                self.df[t] += 1
+
+        self.avg_doc_len = (sum(self.doc_lengths) / len(self.doc_lengths)) if self.doc_lengths else 1.0
+
+    def _bm25_scores(self, query: str) -> Dict[str, float]:
+        if not self.node_ids or not self.doc_term_freqs:
+            return {}
+        q_tokens = _tokenize_for_sparse(query)
+        if not q_tokens:
+            return {}
+
+        N = len(self.node_ids)
+        k1, b = 1.5, 0.75
+        scores = defaultdict(float)
+
+        for q in q_tokens:
+            df = self.df.get(q, 0)
+            if df == 0:
+                continue
+            idf = np.log(1 + (N - df + 0.5) / (df + 0.5))
+            for idx, tf_map in enumerate(self.doc_term_freqs):
+                tf = tf_map.get(q, 0)
+                if tf == 0:
+                    continue
+                dl = self.doc_lengths[idx] if idx < len(self.doc_lengths) else self.avg_doc_len
+                denom = tf + k1 * (1 - b + b * (dl / max(self.avg_doc_len, 1e-6)))
+                scores[self.node_ids[idx]] += idf * (tf * (k1 + 1)) / max(denom, 1e-6)
+
+        if not scores:
+            return {}
+        max_score = max(scores.values()) or 1.0
+        return {nid: s / max_score for nid, s in scores.items()}
+
     async def build_index(self, graph: Dict[str, Dict]):
-        """Build FAISS index from graph nodes."""
-        if not HAS_FAISS:
+        """Build intent/code/structure FAISS indices and sparse lexical stats."""
+        if not HAS_FAISS or not graph:
             return
-        
-        if not graph:
-            return
-        
-        intent_texts = []
-        code_texts = []
+
+        intent_texts, code_texts, structure_texts = [], [], []
         node_ids = []
-        
+
         for node_id, data in graph.items():
-            code_preview = data['code'][:1000]
+            code_preview = data.get('code', '')[:1200]
             symbol_name = data.get('symbol', {}).get('name', node_id.split('::')[-1])
+
             intent_text = f"""
 Function: {symbol_name}
-File: {data['file']}
+File: {data.get('file', '')}
 Route: {data.get('api_route') or ''}
 Docstring:
 {data.get('docstring', '')}
@@ -1808,40 +2035,58 @@ Developer Comments:
 """
             code_text = f"""
 Function: {symbol_name}
-File: {data['file']}
+File: {data.get('file', '')}
 Type: {data.get('type', 'function')}
 Code:
 {code_preview}
 """
+            structure_text = f"""
+Function: {symbol_name}
+Type: {data.get('type', 'function')}
+Args: {', '.join(data.get('arg_names', []))}
+Arg Types: {', '.join(data.get('arg_types', []))}
+Return Type: {data.get('return_type') or ''}
+Decorators: {', '.join(data.get('decorators', []))}
+Exceptions: {', '.join(data.get('exception_types', []))}
+Inherits: {', '.join(data.get('bases', []))}
+"""
+
             intent_texts.append(intent_text)
             code_texts.append(code_text)
+            structure_texts.append(structure_text)
             node_ids.append(node_id)
             self.node_metadata[node_id] = data
-        
+
         if not intent_texts:
             return
-        
-        intent_embeddings = []
-        code_embeddings = []
+
+        self._build_sparse_index([f"{intent_texts[i]}\n{code_texts[i]}\n{structure_texts[i]}" for i in range(len(intent_texts))])
+
+        intent_embeddings, code_embeddings, structure_embeddings = [], [], []
         for i in range(0, len(intent_texts), EMBEDDING_BATCH_SIZE):
-            i_batch = intent_texts[i:i+EMBEDDING_BATCH_SIZE]
-            c_batch = code_texts[i:i+EMBEDDING_BATCH_SIZE]
+            i_batch = intent_texts[i:i + EMBEDDING_BATCH_SIZE]
+            c_batch = code_texts[i:i + EMBEDDING_BATCH_SIZE]
+            s_batch = structure_texts[i:i + EMBEDDING_BATCH_SIZE]
             intent_embeddings.extend(await get_embeddings_batch(i_batch))
             code_embeddings.extend(await get_embeddings_batch(c_batch))
-            print(f"      Embedded {min(i+EMBEDDING_BATCH_SIZE, len(intent_texts))}/{len(intent_texts)} nodes", flush=True)
-        
-        if intent_embeddings and code_embeddings:
+            structure_embeddings.extend(await get_embeddings_batch(s_batch))
+            print(f"      Embedded {min(i + EMBEDDING_BATCH_SIZE, len(intent_texts))}/{len(intent_texts)} nodes", flush=True)
+
+        if intent_embeddings and code_embeddings and structure_embeddings:
             intent_arr = np.array(intent_embeddings, dtype=np.float32)
             code_arr = np.array(code_embeddings, dtype=np.float32)
+            structure_arr = np.array(structure_embeddings, dtype=np.float32)
             faiss.normalize_L2(intent_arr)
             faiss.normalize_L2(code_arr)
+            faiss.normalize_L2(structure_arr)
             self.intent_index.add(intent_arr)
             self.code_index.add(code_arr)
+            self.structure_index.add(structure_arr)
             self.node_ids = node_ids
-    
+
     async def search(self, query: str, k: int = TOP_K_SEEDS) -> List[str]:
-        """Search for top-k most relevant nodes using dual intent/code embeddings."""
-        if not HAS_FAISS or self.intent_index is None or self.code_index is None or self.intent_index.ntotal == 0:
+        """Hybrid search: embedding + BM25 + centrality."""
+        if not HAS_FAISS or self.intent_index is None or self.code_index is None or self.structure_index is None or self.intent_index.ntotal == 0:
             return []
 
         query_emb = await get_embeddings_batch([query])
@@ -1855,37 +2100,47 @@ Code:
         if k == 0:
             return []
 
-        probe_k = min(len(self.node_ids), max(k * 3, 20))
+        probe_k = min(len(self.node_ids), max(k * 5, 40))
         i_dist, i_idx = self.intent_index.search(query_array, probe_k)
         c_dist, c_idx = self.code_index.search(query_array, probe_k)
+        s_dist, s_idx = self.structure_index.search(query_array, probe_k)
 
-        intent_scores = {}
-        code_scores = {}
+        intent_scores, code_scores, struct_scores = {}, {}, {}
         for rank, idx in enumerate(i_idx[0]):
             if idx < len(self.node_ids):
                 intent_scores[self.node_ids[idx]] = float(i_dist[0][rank])
         for rank, idx in enumerate(c_idx[0]):
             if idx < len(self.node_ids):
                 code_scores[self.node_ids[idx]] = float(c_dist[0][rank])
+        for rank, idx in enumerate(s_idx[0]):
+            if idx < len(self.node_ids):
+                struct_scores[self.node_ids[idx]] = float(s_dist[0][rank])
 
-        candidate_ids = set(intent_scores) | set(code_scores)
+        bm25_scores = self._bm25_scores(query)
+        candidate_ids = set(intent_scores) | set(code_scores) | set(struct_scores) | set(bm25_scores)
+
         candidates = []
         for node_id in candidate_ids:
             metadata = self.node_metadata.get(node_id, {})
             intent_similarity = intent_scores.get(node_id, 0.0)
             code_similarity = code_scores.get(node_id, 0.0)
-            graph_prior = min((len(metadata.get('callers', [])) + len(metadata.get('dependencies', []))) / 20.0, 1.0)
+            structure_similarity = struct_scores.get(node_id, 0.0)
+            embedding_score = (0.6 * intent_similarity) + (0.25 * code_similarity) + (0.15 * structure_similarity)
+
+            bm25_score = bm25_scores.get(node_id, 0.0)
+            centrality_score = float(metadata.get('centrality_score', 0.0))
             comments_blob = f"{metadata.get('docstring', '')}\n{metadata.get('comments_above', '')}"
             comment_bonus = _comment_keyword_overlap_score(query, comments_blob)
+            contextual_boost = _comment_contextual_boost(query, comments_blob)
             quality_bonus = float(metadata.get('comment_quality', 0.0))
-            density_bonus = min(float(metadata.get('comment_ratio', 0.0)), 1.0)
 
             final_score = (
-                (INTENT_SIMILARITY_WEIGHT * intent_similarity)
-                + (CODE_SIMILARITY_WEIGHT * code_similarity)
-                + (GRAPH_PROXIMITY_WEIGHT * graph_prior)
+                (EMBEDDING_WEIGHT * embedding_score)
+                + (BM25_WEIGHT * bm25_score)
+                + (CENTRALITY_WEIGHT * centrality_score)
                 + (COMMENT_MATCH_WEIGHT * comment_bonus)
-                + (COMMENT_DENSITY_WEIGHT * ((density_bonus + quality_bonus) / 2.0))
+                + (0.05 * quality_bonus)
+                + contextual_boost
             )
             candidates.append((final_score, node_id))
 
@@ -1895,36 +2150,38 @@ Code:
 
     def save(self, filepath: str):
         """Save index to disk."""
-        if HAS_FAISS and self.intent_index and self.code_index and self.intent_index.ntotal > 0:
-            # Ensure directory exists
+        if HAS_FAISS and self.intent_index and self.code_index and self.structure_index and self.intent_index.ntotal > 0:
             os.makedirs(os.path.dirname(filepath) if os.path.dirname(filepath) else '.', exist_ok=True)
             faiss.write_index(self.intent_index, filepath)
             faiss.write_index(self.code_index, filepath + '.code')
+            faiss.write_index(self.structure_index, filepath + '.struct')
 
             with open(filepath + '.meta', 'w') as f:
                 json.dump({
                     'node_ids': self.node_ids,
-                    'node_metadata': self.node_metadata
+                    'node_metadata': self.node_metadata,
+                    'doc_term_freqs': self.doc_term_freqs,
+                    'doc_lengths': self.doc_lengths,
+                    'df': dict(self.df),
+                    'avg_doc_len': self.avg_doc_len
                 }, f)
         else:
-            raise RuntimeError(
-                "Cannot save index: FAISS unavailable or index is empty."
-            )
+            raise RuntimeError("Cannot save index: FAISS unavailable or index is empty.")
 
-            
     def load(self, filepath: str):
         """Load index from disk."""
         if HAS_FAISS and os.path.exists(filepath):
             self.intent_index = faiss.read_index(filepath)
-            if os.path.exists(filepath + '.code'):
-                self.code_index = faiss.read_index(filepath + '.code')
-            else:
-                # backward compatibility fallback
-                self.code_index = self.intent_index
+            self.code_index = faiss.read_index(filepath + '.code') if os.path.exists(filepath + '.code') else self.intent_index
+            self.structure_index = faiss.read_index(filepath + '.struct') if os.path.exists(filepath + '.struct') else self.intent_index
             with open(filepath + '.meta', 'r') as f:
                 data = json.load(f)
-                self.node_ids = data['node_ids']
-                self.node_metadata = data['node_metadata']
+                self.node_ids = data.get('node_ids', [])
+                self.node_metadata = data.get('node_metadata', {})
+                self.doc_term_freqs = data.get('doc_term_freqs', [])
+                self.doc_lengths = data.get('doc_lengths', [])
+                self.df = defaultdict(int, data.get('df', {}))
+                self.avg_doc_len = data.get('avg_doc_len', 1.0)
 
 # --- Graph Building ---
 
@@ -1933,10 +2190,17 @@ async def build_single_repo_graph(repo_name: str, files_data: Dict[str, Dict]) -
     parser = TreeSitterParser()
     
     parsed_data = {}
-    
+
     print(f"   🔍 Parsing {len(files_data)} files in [{repo_name}]...")
-    for filename, data in files_data.items():
-        result = parser.parse(filename, data['content'])
+    parse_semaphore = asyncio.Semaphore(16)
+
+    async def _parse_one(filename: str, data: Dict[str, str]):
+        async with parse_semaphore:
+            result = await asyncio.to_thread(parser.parse, filename, data['content'])
+            return filename, result
+
+    parse_results = await asyncio.gather(*[_parse_one(filename, data) for filename, data in files_data.items()])
+    for filename, result in parse_results:
         parsed_data[filename] = result
     
     resolver = ImportResolver(files_data)
@@ -1967,7 +2231,8 @@ async def build_single_repo_graph(repo_name: str, files_data: Dict[str, Dict]) -
                 "return_type": node.get('return_type'),
                 "variable_mentions": node.get('variable_mentions', []),
                 "exception_types": node.get('exception_types', []),
-                "decorators": node.get('decorators', [])
+                "decorators": node.get('decorators', []),
+                "bases": node.get('bases', [])
             })
     
     graph = {}
@@ -2006,6 +2271,7 @@ async def build_single_repo_graph(repo_name: str, files_data: Dict[str, Dict]) -
                 "type": impl['type'],
                 "globals": file_globals.get(impl['file'], ""),
                 "dependencies": list(set(valid_deps)),
+                "inherits": [],
                 "callers": [],
                 "api_route": impl.get('api_route'),
                 "api_outbound": impl.get('api_outbound', []),
@@ -2019,7 +2285,10 @@ async def build_single_repo_graph(repo_name: str, files_data: Dict[str, Dict]) -
                 "variable_mentions": impl.get('variable_mentions', []),
                 "exception_types": impl.get('exception_types', []),
                 "decorators": impl.get('decorators', []),
+                "bases": impl.get('bases', []),
                 "global_id": _global_node_id(repo_name, impl['file'], impl.get('symbol', sym_name)),
+                "node_hash": "",
+                "centrality_score": 0.0,
                 "cross_repo_deps": []
             }
     
@@ -2040,6 +2309,7 @@ async def build_single_repo_graph(repo_name: str, files_data: Dict[str, Dict]) -
                 "type": "module",
                 "globals": file_globals.get(filename, ""),
                 "dependencies": [],
+                "inherits": [],
                 "callers": [],
                 "api_route": None,
                 "api_outbound": [],
@@ -2053,7 +2323,10 @@ async def build_single_repo_graph(repo_name: str, files_data: Dict[str, Dict]) -
                 "variable_mentions": [],
                 "exception_types": [],
                 "decorators": [],
+                "bases": [],
                 "global_id": _global_node_id(repo_name, filename, "module"),
+                "node_hash": "",
+                "centrality_score": 0.0,
                 "cross_repo_deps": []
             }
     
@@ -2091,6 +2364,7 @@ async def build_single_repo_graph(repo_name: str, files_data: Dict[str, Dict]) -
             "type": "folder",
             "globals": "",
             "dependencies": [],
+            "inherits": [],
             "callers": [],
             "contains": sorted(children),
             "api_route": None,
@@ -2105,15 +2379,93 @@ async def build_single_repo_graph(repo_name: str, files_data: Dict[str, Dict]) -
             "variable_mentions": [],
             "exception_types": [],
             "decorators": [],
+            "bases": [],
             "global_id": _global_node_id(repo_name, folder_path, folder_key),
+            "node_hash": "",
+            "centrality_score": 0.0,
             "cross_repo_deps": []
         }
+
+    # Add inheritance/interface edges for class nodes.
+    class_name_to_ids = defaultdict(list)
+    for nid, ndata in graph.items():
+        if ndata.get('type') == 'class':
+            class_name_to_ids[ndata.get('symbol', {}).get('name', '').split('.')[-1]].append(nid)
+
+    for nid, ndata in graph.items():
+        if ndata.get('type') != 'class':
+            continue
+        for base in ndata.get('bases', []):
+            candidates = class_name_to_ids.get(base.split('.')[-1], [])
+            if candidates:
+                base_id = candidates[0]
+                if base_id != nid and base_id not in ndata['inherits']:
+                    ndata['inherits'].append(base_id)
+                if base_id != nid and base_id not in ndata['dependencies']:
+                    ndata['dependencies'].append(base_id)
+
+    # Add external library shadow nodes for unresolved imports.
+    external_nodes = {}
+    for filename, result in parsed_data.items():
+        unresolved_libs = set()
+        for imp_stmt in result.get('imports', []):
+            lib = _extract_external_lib_from_import(imp_stmt)
+            if not lib:
+                continue
+            if lib in {'from', 'import'}:
+                continue
+            if lib in [os.path.splitext(os.path.basename(f))[0] for f in files_data.keys()]:
+                continue
+            unresolved_libs.add(lib)
+
+        if not unresolved_libs:
+            continue
+
+        file_nodes = [gid for gid, gdata in graph.items() if gdata.get('file') == filename]
+        for lib in unresolved_libs:
+            ext_id = f"EXT::{lib}"
+            if ext_id not in graph and ext_id not in external_nodes:
+                external_nodes[ext_id] = {
+                    "repo": repo_name,
+                    "symbol": {"repo": repo_name, "file": "<external>", "name": lib},
+                    "file": "<external>",
+                    "code": f"external library: {lib}",
+                    "type": "external_library",
+                    "globals": "",
+                    "dependencies": [],
+                    "inherits": [],
+                    "callers": [],
+                    "api_route": None,
+                    "api_outbound": [],
+                    "docstring": f"External dependency: {lib}",
+                    "comments_above": "",
+                    "comment_ratio": 0.0,
+                    "comment_quality": 0.0,
+                    "arg_names": [], "arg_types": [], "return_type": None,
+                    "variable_mentions": [], "exception_types": [], "decorators": [],
+                    "bases": [],
+                    "global_id": _global_node_id(repo_name, "<external>", lib),
+                    "node_hash": "",
+                    "centrality_score": 0.0,
+                    "cross_repo_deps": []
+                }
+            for fnid in file_nodes:
+                if ext_id not in graph[fnid]['dependencies']:
+                    graph[fnid]['dependencies'].append(ext_id)
+
+    graph.update(external_nodes)
 
     # Populate reverse dependency edges (callers)
     for source_id, source_data in graph.items():
         for target_id in source_data.get('dependencies', []):
             if target_id in graph and source_id not in graph[target_id]['callers']:
                 graph[target_id]['callers'].append(source_id)
+
+    # Compute centrality + node content hash.
+    for nid, ndata in graph.items():
+        degree = len(ndata.get('callers', [])) + len(ndata.get('dependencies', []))
+        ndata['centrality_score'] = min(degree / 25.0, 1.0)
+        ndata['node_hash'] = _compute_node_content_hash(ndata)
 
     print(f"   ✅ Built graph for [{repo_name}]: {len(graph)} nodes")
     return graph, resolver
@@ -2164,6 +2516,7 @@ async def build_multi_symbol_graph(
     multi_repo_data: Dict[str, Dict],
     summarizer: ProjectSummarizer,
     previous_graph: Optional[Dict[str, Dict]] = None,
+    previous_vector_stores: Optional[Dict[str, 'VectorEmbeddingStore']] = None,
     previous_file_hashes: Optional[Dict[str, Dict[str, str]]] = None,
     current_file_hashes: Optional[Dict[str, Dict[str, str]]] = None
 ) -> Tuple[Dict, Dict]:
@@ -2216,19 +2569,43 @@ async def build_multi_symbol_graph(
     if has_nodes and HAS_FAISS:
         print("   🧬 Building vector embeddings...")
         combined_graph = {}
+        previous_vector_stores = previous_vector_stores or {}
+
         for repo_name, graph in multi_graph.items():
-            if graph:  # Only if graph has nodes
+            if not graph:
+                continue
+
+            # Reuse prior index when node hashes are unchanged.
+            can_reuse = False
+            prev_repo_graph = (previous_graph or {}).get(repo_name, {})
+            prev_store = previous_vector_stores.get(repo_name)
+            if prev_repo_graph and prev_store:
+                new_hashes = sorted([n.get('node_hash', '') for n in graph.values()])
+                old_hashes = sorted([n.get('node_hash', '') for n in prev_repo_graph.values()])
+                can_reuse = new_hashes == old_hashes
+
+            if can_reuse:
+                vector_stores[repo_name] = prev_store
+            else:
                 store = VectorEmbeddingStore()
                 await store.build_index(graph)
                 vector_stores[repo_name] = store
-                for node_id, node_data in graph.items():
-                    combined_graph[node_data.get('global_id', _global_node_id(repo_name, node_data.get('file', ''), node_data.get('symbol', {}).get('name', node_id.split('::')[-1])))] = node_data
 
-        # Optional global index improves ALL-mode retrieval scalability.
-        if combined_graph:
-            global_store = VectorEmbeddingStore()
-            await global_store.build_index(combined_graph)
-            vector_stores['__global__'] = global_store
+            for node_id, node_data in graph.items():
+                combined_graph[node_data.get('global_id', _global_node_id(repo_name, node_data.get('file', ''), node_data.get('symbol', {}).get('name', node_id.split('::')[-1])))] = node_data
+
+        # Cap global index: only for multi-repo setups and favor cross-repo/API-relevant nodes if huge.
+        if len(multi_graph) > 1 and combined_graph:
+            global_candidates = combined_graph
+            if len(combined_graph) > 7000:
+                global_candidates = {
+                    nid: nd for nid, nd in combined_graph.items()
+                    if nd.get('api_route') or nd.get('cross_repo_deps') or nd.get('type') in {'external_library', 'folder'}
+                }
+            if global_candidates:
+                global_store = VectorEmbeddingStore()
+                await global_store.build_index(global_candidates)
+                vector_stores['__global__'] = global_store
     
     with open(GRAPH_FILE, 'w') as f:
         json.dump(multi_graph, f, indent=2)
@@ -2268,6 +2645,7 @@ def _node_expansion_priority(
     comment_overlap = _comment_keyword_overlap_score(query, comment_blob)
     comment_density = min(float(node.get('comment_ratio', 0.0)), 1.0)
     comment_quality = float(node.get('comment_quality', 0.0))
+    centrality = float(node.get('centrality_score', 0.0))
     graph_proximity = 1.0 / (distance + 1)
 
     comment_weight = 1.6 if explanation_weight_mode else 1.0
@@ -2279,6 +2657,7 @@ def _node_expansion_priority(
         + (COMMENT_DENSITY_WEIGHT * comment_density)
         + (quality_weight * comment_quality)
         + (GRAPH_PROXIMITY_WEIGHT * graph_proximity)
+        + (CENTRALITY_WEIGHT * centrality)
     )
 
 
@@ -2659,6 +3038,37 @@ async def autonomous_answering_loop(
         return await answering_agent(user_query, context_pool)
     return "I tried multiple retrieval passes but could not find enough evidence to answer confidently."
 
+def compress_context_strings(context_strings: List[str], token_budget: int = CONTEXT_COMPRESSION_TRIGGER_TOKENS) -> List[str]:
+    """Compress context opportunistically by removing repetitive globals and oversize slices."""
+    if not context_strings:
+        return context_strings
+
+    full = "\n".join(context_strings)
+    if count_tokens(full) <= token_budget:
+        return context_strings
+
+    compressed = []
+    seen_globals = set()
+    for block in context_strings:
+        b = block
+        globals_match = re.search(r"--- FILE GLOBALS, IMPORTS AND CONSTANTS ---\n(.*?)\n=+", b, re.DOTALL)
+        if globals_match:
+            g = globals_match.group(1).strip()
+            g_hash = hashlib.md5(g.encode('utf-8', errors='ignore')).hexdigest()
+            if g_hash in seen_globals:
+                b = b.replace(globals_match.group(0), "")
+            else:
+                seen_globals.add(g_hash)
+
+        if len(b) > 10000:
+            lines = b.splitlines()
+            b = "\n".join(lines[:120] + ["... [compressed] ..."] + lines[-120:])
+
+        compressed.append(b)
+
+    return truncate_to_token_budget(compressed, token_budget)
+
+
 # --- Reframer ---
 
 async def reframer_agent(user_query: str, chat_history: List[Dict], available_repos: List[str]) -> Dict[str, Any]:
@@ -2734,6 +3144,7 @@ async def answering_agent(user_query: str, context_strings: List[str]) -> str:
     """Generate answer with streaming output."""
     print("📝 Answering Agent: Generating response...", flush=True)
     
+    context_strings = compress_context_strings(context_strings)
     full_context = "\n".join(context_strings)
     context_tokens = count_tokens(full_context)
     print(f"   📊 Context size: {context_tokens} tokens")
@@ -2862,6 +3273,7 @@ async def main():
                     multi_repo_data,
                     summarizer,
                     previous_graph=cached_graph,
+                    previous_vector_stores=cached_vectors,
                     previous_file_hashes=cached_file_hashes,
                     current_file_hashes=current_file_hashes
                 )
