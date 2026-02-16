@@ -125,8 +125,16 @@ BACKWARD_TRAVERSAL_DEPTH = 3
 INCLUDE_HIGH_LEVEL_CONTEXT = True
 MAX_SUMMARY_TOKENS = 4000
 
+# Retrieval weighting configuration
+COMMENT_MATCH_WEIGHT = 0.2
+COMMENT_DENSITY_WEIGHT = 0.1
+
 # Cache Configuration
-CACHE_DIR = "./pipeline_cache"
+TENANT_ID = os.getenv("GITHUB_AGENT_TENANT", "default_tenant")
+SESSION_ID = os.getenv("GITHUB_AGENT_SESSION", "default_session")
+RUNTIME_ROOT = os.path.join("./runtime_data", TENANT_ID, SESSION_ID)
+
+CACHE_DIR = os.path.join(RUNTIME_ROOT, "pipeline_cache")
 CACHE_FILE = os.path.join(CACHE_DIR, "cache_metadata.json")
 GRAPH_FILE = os.path.join(CACHE_DIR, "symbol_graph.json")
 
@@ -137,7 +145,7 @@ client = AsyncOpenAI(api_key=OPENAI_API_KEY)
 tokenizer = tiktoken.encoding_for_model(MODEL_NAME)
 
 # Paths
-TEMP_DIR = "./temp_session_data"
+TEMP_DIR = os.path.join(RUNTIME_ROOT, "temp_session_data")
 
 # --- Helper: Force Delete Read-Only Files ---
 def handle_remove_readonly(func, path, exc):
@@ -215,6 +223,60 @@ def normalize_route(route: str) -> str:
     route = re.sub(r'/\{[^}]+\}', '/*', route)
     route = re.sub(r'/\*+', '/*', route)
     return route.lower().strip()
+
+
+def _extract_preceding_comment_block(lines: List[str], start_line_1_idx: int) -> str:
+    """Extract contiguous comments immediately above a symbol start line."""
+    idx = max(0, start_line_1_idx - 2)
+    comment_lines = []
+
+    while idx >= 0:
+        stripped = lines[idx].strip()
+        if not stripped:
+            if comment_lines:
+                break
+            idx -= 1
+            continue
+
+        if stripped.startswith('#') or stripped.startswith('//') or stripped.startswith('/*') or stripped.startswith('*') or stripped.endswith('*/'):
+            comment_lines.append(lines[idx])
+            idx -= 1
+            continue
+
+        break
+
+    return "\n".join(reversed(comment_lines)).strip()
+
+
+def _extract_python_docstring(code: str) -> str:
+    """Extract first python docstring from a function/class snippet."""
+    try:
+        tree = ast.parse(code)
+        if tree.body and isinstance(tree.body[0], (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            return ast.get_docstring(tree.body[0]) or ""
+    except Exception:
+        return ""
+    return ""
+
+
+def _extract_block_docstring(code: str) -> str:
+    """Extract JS/Java style block docstring from a code snippet."""
+    match = re.search(r"/\*\*(.*?)\*/", code, re.DOTALL)
+    return match.group(1).strip() if match else ""
+
+
+def _comment_keyword_overlap_score(query: str, comment_text: str) -> float:
+    """Simple lexical overlap score between query and comment/docs."""
+    if not query or not comment_text:
+        return 0.0
+
+    q_tokens = set(re.findall(r"[a-zA-Z_]{3,}", query.lower()))
+    c_tokens = set(re.findall(r"[a-zA-Z_]{3,}", comment_text.lower()))
+    if not q_tokens or not c_tokens:
+        return 0.0
+
+    overlap = q_tokens.intersection(c_tokens)
+    return len(overlap) / len(q_tokens)
 
 def init_cache_dir():
     """Create cache directory if it doesn't exist."""
@@ -741,6 +803,28 @@ class TreeSitterParser:
         """Extract text from a node."""
         return content[node.start_byte:node.end_byte]
 
+
+    def _extract_symbol_docs(self, node, content: str, code: str, language_hint: str) -> Dict[str, Any]:
+        """Extract per-symbol structured comments/docstrings for ranking and embedding."""
+        lines = content.split('\n')
+        start_line = getattr(node, 'start_point', (0, 0))[0] + 1
+        comments_above = _extract_preceding_comment_block(lines, start_line)
+
+        if language_hint == 'python':
+            docstring = _extract_python_docstring(code)
+        else:
+            docstring = _extract_block_docstring(code)
+
+        comment_tokens = len(re.findall(r"[a-zA-Z_]+", f"{docstring}\n{comments_above}"))
+        code_tokens = max(len(re.findall(r"[a-zA-Z_]+", code)), 1)
+        comment_ratio = comment_tokens / code_tokens
+
+        return {
+            "docstring": docstring,
+            "comments_above": comments_above,
+            "comment_ratio": comment_ratio
+        }
+
     def _extract_python(self, root, content: str) -> Dict[str, Any]:
         """Extract Python symbols."""
         nodes = []
@@ -759,6 +843,7 @@ class TreeSitterParser:
                     calls = self._extract_calls_python(node, content)
                     api_route = self._extract_python_route(node, content)
                     api_calls = self._extract_api_calls(code)
+                    comment_meta = self._extract_symbol_docs(node, content, code, 'python')
                     
                     nodes.append({
                         "name": full_name,
@@ -766,7 +851,8 @@ class TreeSitterParser:
                         "code": code,
                         "calls": calls,
                         "api_route": api_route,
-                        "api_outbound": api_calls
+                        "api_outbound": api_calls,
+                        **comment_meta
                     })
             
             elif node.type == 'class_definition':
@@ -833,6 +919,7 @@ class TreeSitterParser:
                     code = self._get_text(node, content)
                     calls = self._extract_calls_js(node, content)
                     api_calls = self._extract_api_calls(code)
+                    comment_meta = self._extract_symbol_docs(node, content, code, 'other')
                     
                     nodes.append({
                         "name": name,
@@ -840,7 +927,8 @@ class TreeSitterParser:
                         "code": code,
                         "calls": calls,
                         "api_route": None,
-                        "api_outbound": api_calls
+                        "api_outbound": api_calls,
+                        **comment_meta
                     })
             
             elif node.type == 'lexical_declaration':
@@ -854,6 +942,7 @@ class TreeSitterParser:
                                 code = self._get_text(child, content)
                                 calls = self._extract_calls_js(value_node, content)
                                 api_calls = self._extract_api_calls(code)
+                                comment_meta = self._extract_symbol_docs(child, content, code, 'javascript')
                                 
                                 nodes.append({
                                     "name": name,
@@ -861,7 +950,8 @@ class TreeSitterParser:
                                     "code": code,
                                     "calls": calls,
                                     "api_route": None,
-                                    "api_outbound": api_calls
+                                    "api_outbound": api_calls,
+                                    **comment_meta
                                 })
             
             elif node.type == 'class_declaration':
@@ -1009,6 +1099,7 @@ class TreeSitterParser:
                     code = self._get_text(node, content)
                     calls = self._extract_calls_go(node, content)
                     api_calls = self._extract_api_calls(code)
+                    comment_meta = self._extract_symbol_docs(node, content, code, 'other')
                     
                     nodes.append({
                         "name": name,
@@ -1016,7 +1107,8 @@ class TreeSitterParser:
                         "code": code,
                         "calls": calls,
                         "api_route": None,
-                        "api_outbound": api_calls
+                        "api_outbound": api_calls,
+                        **comment_meta
                     })
             
             for child in node.children:
@@ -1062,6 +1154,7 @@ class TreeSitterParser:
                     code = self._get_text(node, content)
                     calls = self._extract_calls_rust(node, content)
                     api_calls = self._extract_api_calls(code)
+                    comment_meta = self._extract_symbol_docs(node, content, code, 'other')
                     
                     nodes.append({
                         "name": name,
@@ -1069,7 +1162,8 @@ class TreeSitterParser:
                         "code": code,
                         "calls": calls,
                         "api_route": None,
-                        "api_outbound": api_calls
+                        "api_outbound": api_calls,
+                        **comment_meta
                     })
             
             for child in node.children:
@@ -1118,6 +1212,7 @@ class TreeSitterParser:
                         code = self._get_text(node, content)
                         calls = self._extract_calls_cpp(node, content)
                         api_calls = self._extract_api_calls(code)
+                        comment_meta = self._extract_symbol_docs(node, content, code, 'other')
                         
                         nodes.append({
                             "name": full_name,
@@ -1125,7 +1220,8 @@ class TreeSitterParser:
                             "code": code,
                             "calls": calls,
                             "api_route": None,
-                            "api_outbound": api_calls
+                            "api_outbound": api_calls,
+                            **comment_meta
                         })
             
             elif node.type == 'class_specifier':
@@ -1195,13 +1291,15 @@ class TreeSitterParser:
                     code = self._get_text(node, content)
                     calls = self._extract_calls_bash(node, content)
                     
+                    comment_meta = self._extract_symbol_docs(node, content, code, 'other')
                     nodes.append({
                         "name": name,
                         "type": "function",
                         "code": code,
                         "calls": calls,
                         "api_route": None,
-                        "api_outbound": []
+                        "api_outbound": [],
+                        **comment_meta
                     })
             
             for child in node.children:
@@ -1271,13 +1369,19 @@ class TreeSitterParser:
                     
                     api_calls = self._extract_api_calls(code_snippet)
                     
+                    docstring = _extract_block_docstring(code_snippet)
+                    comment_tokens = len(re.findall(r"[a-zA-Z_]+", docstring))
+                    code_tokens = max(len(re.findall(r"[a-zA-Z_]+", code_snippet)), 1)
                     nodes.append({
                         "name": name,
                         "type": "function",
                         "code": code_snippet,
                         "calls": calls,
                         "api_route": None,
-                        "api_outbound": api_calls
+                        "api_outbound": api_calls,
+                        "docstring": docstring,
+                        "comments_above": "",
+                        "comment_ratio": comment_tokens / code_tokens
                     })
                     break
         
@@ -1490,6 +1594,7 @@ class VectorEmbeddingStore:
         self.index = None
         self.node_ids = []
         self.node_metadata = {}
+        self.last_scores = {}
         
         if HAS_FAISS:
             self.index = faiss.IndexFlatIP(dimension)
@@ -1506,9 +1611,25 @@ class VectorEmbeddingStore:
         node_ids = []
         
         for node_id, data in graph.items():
-            code_preview = data['code'][:500]
-            text = f"{node_id} {data['file']} {code_preview}"
-            texts.append(text)
+            code_preview = data['code'][:700]
+            symbol_name = data.get('symbol', {}).get('name', node_id.split('::')[-1])
+            embedding_text = f"""
+Function: {symbol_name}
+File: {data['file']}
+Type: {data.get('type', 'function')}
+Docstring:
+{data.get('docstring', '')}
+
+Developer Comments:
+{data.get('comments_above', '')}
+
+Globals:
+{data.get('globals', '')[:500]}
+
+Code:
+{code_preview}
+"""
+            texts.append(embedding_text)
             node_ids.append(node_id)
             self.node_metadata[node_id] = data
         
@@ -1545,8 +1666,22 @@ class VectorEmbeddingStore:
             return []
         
         distances, indices = self.index.search(query_array, k)
-        result_ids = [self.node_ids[idx] for idx in indices[0] if idx < len(self.node_ids)]
-        return result_ids
+        candidates = []
+        for rank, idx in enumerate(indices[0]):
+            if idx >= len(self.node_ids):
+                continue
+            node_id = self.node_ids[idx]
+            semantic_score = float(distances[0][rank])
+            metadata = self.node_metadata.get(node_id, {})
+            comments_blob = f"{metadata.get('docstring', '')}\n{metadata.get('comments_above', '')}"
+            comment_bonus = _comment_keyword_overlap_score(query, comments_blob)
+            density_bonus = min(float(metadata.get('comment_ratio', 0.0)), 1.0)
+            final_score = semantic_score + (COMMENT_MATCH_WEIGHT * comment_bonus) + (COMMENT_DENSITY_WEIGHT * density_bonus)
+            candidates.append((final_score, node_id))
+
+        candidates.sort(reverse=True, key=lambda item: item[0])
+        self.last_scores = {node_id: score for score, node_id in candidates}
+        return [node_id for score, node_id in candidates[:k]]
     
     def save(self, filepath: str):
         """Save index to disk."""
@@ -1601,11 +1736,15 @@ async def build_single_repo_graph(repo_name: str, files_data: Dict[str, Dict]) -
             name = node['name']
             symbol_registry[name].append({
                 "file": filename,
+                "symbol": name,
                 "type": node['type'],
                 "code": node['code'],
                 "calls": node['calls'],
                 "api_route": node.get('api_route'),
-                "api_outbound": node.get('api_outbound', [])
+                "api_outbound": node.get('api_outbound', []),
+                "docstring": node.get('docstring', ''),
+                "comments_above": node.get('comments_above', ''),
+                "comment_ratio": node.get('comment_ratio', 0.0)
             })
     
     graph = {}
@@ -1637,13 +1776,19 @@ async def build_single_repo_graph(repo_name: str, files_data: Dict[str, Dict]) -
                                 valid_deps.append(target_id)
             
             graph[node_id] = {
+                "repo": repo_name,
+                "symbol": {"repo": repo_name, "file": impl['file'], "name": impl.get('symbol', sym_name)},
                 "file": impl['file'],
                 "code": impl['code'],
                 "type": impl['type'],
                 "globals": file_globals.get(impl['file'], ""),
                 "dependencies": list(set(valid_deps)),
+                "callers": [],
                 "api_route": impl.get('api_route'),
                 "api_outbound": impl.get('api_outbound', []),
+                "docstring": impl.get('docstring', ''),
+                "comments_above": impl.get('comments_above', ''),
+                "comment_ratio": impl.get('comment_ratio', 0.0),
                 "cross_repo_deps": []
             }
     
@@ -1657,16 +1802,28 @@ async def build_single_repo_graph(repo_name: str, files_data: Dict[str, Dict]) -
             # Add a placeholder 'module' node so the file is seen by the summarizer and overview
             node_id = f"{filename}::module"
             graph[node_id] = {
+                "repo": repo_name,
+                "symbol": {"repo": repo_name, "file": filename, "name": "module"},
                 "file": filename,
                 "code": data['content'][:2000], # Include some preview
                 "type": "module",
                 "globals": file_globals.get(filename, ""),
                 "dependencies": [],
+                "callers": [],
                 "api_route": None,
                 "api_outbound": [],
+                "docstring": "",
+                "comments_above": "",
+                "comment_ratio": 0.0,
                 "cross_repo_deps": []
             }
     
+    # Populate reverse dependency edges (callers)
+    for source_id, source_data in graph.items():
+        for target_id in source_data.get('dependencies', []):
+            if target_id in graph and source_id not in graph[target_id]['callers']:
+                graph[target_id]['callers'].append(source_id)
+
     print(f"   ✅ Built graph for [{repo_name}]: {len(graph)} nodes")
     return graph, resolver
 
@@ -1721,16 +1878,18 @@ async def build_multi_symbol_graph(multi_repo_data: Dict[str, Dict], summarizer:
     
     for repo_name, files_data in multi_repo_data.items():
         graph, resolver = await build_single_repo_graph(repo_name, files_data)
-        
-        # Project Summarization: Summarize each file
+
+        # Project Summarization: summarize files concurrently with cap to avoid cost spikes.
         print(f"   📝 Summarizing {len(files_data)} files in [{repo_name}]...")
-        for filename, data in files_data.items():
-            nodes = graph.get(filename, {}).get('nodes', []) # This is wrong, graph is node_id based
-            # Let's fix this: group nodes by file
-            file_nodes = [nd for nid, nd in graph.items() if nd['file'] == filename]
-            # nodes in build_single_repo_graph are internal, let's just pass some context
-            await summarizer.summarize_file(filename, data['content'], [{"name": k.split("::")[-1]} for k in graph.keys() if graph[k]['file'] == filename])
-            
+        semaphore = asyncio.Semaphore(10)
+
+        async def _summarize_one(fname: str, data: Dict[str, str]):
+            async with semaphore:
+                symbol_names = [{"name": k.split("::")[-1]} for k in graph.keys() if graph[k]['file'] == fname]
+                await summarizer.summarize_file(fname, data['content'], symbol_names)
+
+        await asyncio.gather(*[_summarize_one(filename, data) for filename, data in files_data.items()])
+
         multi_graph[repo_name] = graph
         resolvers[repo_name] = resolver
     
@@ -1746,11 +1905,20 @@ async def build_multi_symbol_graph(multi_repo_data: Dict[str, Dict], summarizer:
     
     if has_nodes and HAS_FAISS:
         print("   🧬 Building vector embeddings...")
+        combined_graph = {}
         for repo_name, graph in multi_graph.items():
             if graph:  # Only if graph has nodes
                 store = VectorEmbeddingStore()
                 await store.build_index(graph)
                 vector_stores[repo_name] = store
+                for node_id, node_data in graph.items():
+                    combined_graph[f"{repo_name}::{node_id}"] = node_data
+
+        # Optional global index improves ALL-mode retrieval scalability.
+        if combined_graph:
+            global_store = VectorEmbeddingStore()
+            await global_store.build_index(combined_graph)
+            vector_stores['__global__'] = global_store
     
     with open(GRAPH_FILE, 'w') as f:
         json.dump(multi_graph, f, indent=2)
@@ -1778,7 +1946,7 @@ def _extract_specific_targets(query: str, hints: List[str], active_graph: Dict) 
                 
     return targets
 
-def _backward_traverse(
+def _dependency_traverse(
     seed_nodes: Set[str],
     active_graph: Dict,
     max_depth: int = BACKWARD_TRAVERSAL_DEPTH
@@ -1806,6 +1974,27 @@ def _backward_traverse(
         depth += 1
     return selected
 
+
+def _caller_traverse(seed_nodes: Set[str], active_graph: Dict, max_depth: int = 2) -> Set[str]:
+    """Traverse reverse edges to find who calls the seed nodes."""
+    selected = set(seed_nodes)
+    queue = list(seed_nodes)
+    depth = 0
+
+    while queue and depth < max_depth:
+        next_queue = []
+        for node_id in queue:
+            node = active_graph.get(node_id)
+            if not node:
+                continue
+            for caller_id in node.get('callers', []):
+                if caller_id in active_graph and caller_id not in selected:
+                    selected.add(caller_id)
+                    next_queue.append(caller_id)
+        queue = next_queue
+        depth += 1
+    return selected
+
 async def selector_agent_enhanced(
     target_repo: str,
     technical_query: str,
@@ -1824,8 +2013,14 @@ async def selector_agent_enhanced(
         for r_name, g_data in multi_graph.items():
             for node_id, node_data in g_data.items():
                 prefixed_id = f"{r_name}::{node_id}"
-                active_graph[prefixed_id] = node_data
+                # normalize dependency/caller ids to prefixed graph ids in ALL mode
+                normalized_node = dict(node_data)
+                normalized_node['dependencies'] = [f"{r_name}::{d}" for d in node_data.get('dependencies', [])]
+                normalized_node['callers'] = [f"{r_name}::{c}" for c in node_data.get('callers', [])]
+                active_graph[prefixed_id] = normalized_node
             active_stores[r_name] = vector_stores.get(r_name)
+        if '__global__' in vector_stores:
+            active_stores['__global__'] = vector_stores['__global__']
     else:
         active_graph = {k: v for k, v in multi_graph[target_repo].items()}
         active_stores = {target_repo: vector_stores.get(target_repo)}
@@ -1847,8 +2042,10 @@ async def selector_agent_enhanced(
     if (query_type == "SPECIFIC" or hints) and active_graph:
         specific_seeds = _extract_specific_targets(technical_query, hints or [], active_graph)
         if specific_seeds:
-            print(f"   � Target Seeds: {list(specific_seeds)[:3]}")
-            selected_nodes.update(_backward_traverse(specific_seeds, active_graph))
+            print(f"   🎯 Target Seeds: {list(specific_seeds)[:3]}")
+            selected_nodes.update(_dependency_traverse(specific_seeds, active_graph, max_depth=2 if query_type == "SPECIFIC" else BACKWARD_TRAVERSAL_DEPTH))
+            if re.search(r"who\s+uses|callers?|used\s+by", technical_query, re.IGNORECASE):
+                selected_nodes.update(_caller_traverse(specific_seeds, active_graph, max_depth=2))
 
     # Strategy 3: Vector Fallback / FUNCTIONAL_AREA
     if not selected_nodes and active_graph:
@@ -1857,14 +2054,17 @@ async def selector_agent_enhanced(
             if store and HAS_FAISS:
                 search_results = await store.search(technical_query, k=TOP_K_SEEDS)
                 for result_id in search_results:
-                    full_id = f"{repo}::{result_id}" if target_repo == "ALL" else result_id
+                    if repo == '__global__':
+                        full_id = result_id
+                    else:
+                        full_id = f"{repo}::{result_id}" if target_repo == "ALL" else result_id
                     if full_id in active_graph:
                         seed_nodes.add(full_id)
         
         if not seed_nodes:
             seed_nodes = await llm_seed_selection(technical_query, active_graph)
             
-        selected_nodes.update(_backward_traverse(seed_nodes, active_graph, max_depth=MAX_RECURSION_DEPTH))
+        selected_nodes.update(_dependency_traverse(seed_nodes, active_graph, max_depth=3 if query_type == "FUNCTIONAL_AREA" else MAX_RECURSION_DEPTH))
 
     context_strings = build_context_with_budget(selected_nodes, active_graph, target_repo)
     return extra_context + context_strings
@@ -2116,12 +2316,14 @@ def load_cache(current_hashes: Dict, summarizer: ProjectSummarizer) -> Optional[
         multi_graph = cache_data['graph']
         
         vector_stores = {}
-        for repo_name in multi_graph.keys():
+        index_files = [f for f in os.listdir(CACHE_DIR) if f.endswith('.faiss')]
+        for index_file in index_files:
+            store_key = index_file[:-6]
             store = VectorEmbeddingStore()
-            index_path = os.path.join(CACHE_DIR, f"{repo_name}.faiss")
+            index_path = os.path.join(CACHE_DIR, index_file)
             if os.path.exists(index_path):
                 store.load(index_path)
-                vector_stores[repo_name] = store
+                vector_stores[store_key] = store
         
         # Load summaries
         summarizer.load(os.path.join(CACHE_DIR, "summaries.json"))
