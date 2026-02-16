@@ -9,6 +9,7 @@ import re
 import ast
 import hashlib
 import time
+from difflib import SequenceMatcher
 from typing import List, Dict, Optional, Set, Any, Tuple
 from collections import defaultdict
 from git import Repo
@@ -142,6 +143,7 @@ CENTRALITY_WEIGHT = 0.2
 BM25_WEIGHT = 0.3
 EMBEDDING_WEIGHT = 0.5
 CONTEXT_COMPRESSION_TRIGGER_TOKENS = 22000
+LAST_SELECTOR_NODES: List[str] = []
 
 # Cache Configuration
 TENANT_ID = os.getenv("GITHUB_AGENT_TENANT", "default_tenant")
@@ -151,6 +153,8 @@ RUNTIME_ROOT = os.path.join("./runtime_data", TENANT_ID, SESSION_ID)
 CACHE_DIR = os.path.join(RUNTIME_ROOT, "pipeline_cache")
 CACHE_FILE = os.path.join(CACHE_DIR, "cache_metadata.json")
 GRAPH_FILE = os.path.join(CACHE_DIR, "symbol_graph.json")
+MEMORY_FILE = os.path.join(CACHE_DIR, "reasoning_memory.json")
+VISUALIZATION_DIR = os.path.join(RUNTIME_ROOT, "visualizations")
 
 if not OPENAI_API_KEY:
     print("⚠️ OPENAI_API_KEY not found in .env. Please set it.")
@@ -309,6 +313,382 @@ def _normalize_scores(scores: Dict[str, float]) -> Dict[str, float]:
         return {k: 1.0 for k in scores.keys()}
     return {k: (v - min_val) / (max_val - min_val) for k, v in scores.items()}
 
+
+TAINT_SOURCES = {"input", "request.get", "req.body", "request.args.get", "request.form.get", "request.json", "sys.argv"}
+TAINT_SINKS = {"db.execute", "cursor.execute", "eval", "exec", "subprocess.run", "os.system"}
+SANITIZERS = {"sanitize", "escape", "quote", "clean", "validate"}
+
+
+def _safe_ast_parse(code: str):
+    try:
+        return ast.parse(code or "")
+    except Exception:
+        return None
+
+
+def _name_from_call(call: ast.Call) -> str:
+    fn = call.func
+    if isinstance(fn, ast.Name):
+        return fn.id
+    if isinstance(fn, ast.Attribute):
+        base = ""
+        if isinstance(fn.value, ast.Name):
+            base = fn.value.id + "."
+        return f"{base}{fn.attr}"
+    return ""
+
+
+def _extract_type_awareness(code: str) -> Dict[str, Any]:
+    tree = _safe_ast_parse(code)
+    result = {
+        "type_registry": {},
+        "interface_links": [],
+        "generic_usages": [],
+        "field_links": {}
+    }
+    if tree is None:
+        return result
+
+    for n in ast.walk(tree):
+        if isinstance(n, ast.ClassDef):
+            fields = []
+            methods = []
+            for b in n.body:
+                if isinstance(b, ast.FunctionDef):
+                    methods.append(b.name)
+                if isinstance(b, ast.AnnAssign) and isinstance(b.target, ast.Name):
+                    fields.append(b.target.id)
+                if isinstance(b, ast.Assign):
+                    for t in b.targets:
+                        if isinstance(t, ast.Name):
+                            fields.append(t.id)
+            bases = [getattr(base, 'id', getattr(base, 'attr', '')) for base in n.bases]
+            result["type_registry"][n.name] = {"fields": sorted(set(fields)), "methods": sorted(set(methods)), "bases": bases}
+            for b in bases:
+                if b:
+                    result["interface_links"].append({"class": n.name, "implements": b})
+        if isinstance(n, ast.Subscript):
+            outer = getattr(n.value, 'id', getattr(n.value, 'attr', ''))
+            inner = ast.unparse(n.slice) if hasattr(ast, 'unparse') else ""
+            if outer and inner:
+                result["generic_usages"].append({"container": outer, "inner": inner})
+        if isinstance(n, ast.Attribute) and isinstance(n.value, ast.Name):
+            key = f"{n.value.id}.{n.attr}"
+            result["field_links"].setdefault(key, 0)
+            result["field_links"][key] += 1
+
+    return result
+
+
+def _extract_python_cfg(code: str) -> Dict[str, Any]:
+    tree = _safe_ast_parse(code)
+    if tree is None:
+        return {"blocks": [], "edges": []}
+
+    blocks, edges = [], []
+    block_id = 0
+
+    def add_block(kind: str, lineno: int) -> int:
+        nonlocal block_id
+        bid = block_id
+        block_id += 1
+        blocks.append({"id": bid, "kind": kind, "lineno": lineno})
+        return bid
+
+    prev = None
+    for stmt in tree.body:
+        kind = type(stmt).__name__
+        curr = add_block(kind, getattr(stmt, 'lineno', 0))
+        if prev is not None:
+            edges.append((prev, curr))
+        prev = curr
+
+        if isinstance(stmt, ast.If):
+            cond_id = curr
+            if stmt.body:
+                t_id = add_block("IfBody", getattr(stmt.body[0], 'lineno', 0))
+                edges.append((cond_id, t_id))
+            if stmt.orelse:
+                e_id = add_block("ElseBody", getattr(stmt.orelse[0], 'lineno', 0))
+                edges.append((cond_id, e_id))
+        if isinstance(stmt, (ast.For, ast.While)):
+            loop_entry = curr
+            if stmt.body:
+                body_id = add_block("LoopBody", getattr(stmt.body[0], 'lineno', 0))
+                edges.append((loop_entry, body_id))
+                edges.append((body_id, loop_entry))
+        if isinstance(stmt, (ast.Return, ast.Raise)):
+            end_id = add_block("Exit", getattr(stmt, 'lineno', 0))
+            edges.append((curr, end_id))
+
+    return {"blocks": blocks, "edges": edges}
+
+
+def _extract_python_data_flow(code: str) -> Dict[str, Any]:
+    tree = _safe_ast_parse(code)
+    data = {
+        "defs": {},
+        "uses": defaultdict(list),
+        "edges": [],
+        "return_flows": [],
+        "field_dependencies": defaultdict(list),
+        "taint": {"sources": [], "sinks": [], "sanitizers": [], "vulnerabilities": []}
+    }
+    if tree is None:
+        return {
+            "defs": {}, "uses": {}, "edges": [], "return_flows": [], "field_dependencies": {},
+            "taint": {"sources": [], "sinks": [], "sanitizers": [], "vulnerabilities": []}
+        }
+
+    tainted = set()
+
+    for n in ast.walk(tree):
+        if isinstance(n, ast.Assign):
+            rhs_names = {x.id for x in ast.walk(n.value) if isinstance(x, ast.Name)}
+            rhs_attrs = {f"{x.value.id}.{x.attr}" for x in ast.walk(n.value) if isinstance(x, ast.Attribute) and isinstance(x.value, ast.Name)}
+            call_name = _name_from_call(n.value) if isinstance(n.value, ast.Call) else ""
+
+            for t in n.targets:
+                if isinstance(t, ast.Name):
+                    var = t.id
+                    data["defs"][var] = getattr(n, 'lineno', 0)
+                    for src in rhs_names:
+                        data["edges"].append((src, var))
+                    for src in rhs_attrs:
+                        data["edges"].append((src, var))
+                    if any(src in tainted for src in rhs_names) or call_name in TAINT_SOURCES:
+                        tainted.add(var)
+                if isinstance(t, ast.Attribute) and isinstance(t.value, ast.Name):
+                    field = f"{t.value.id}.{t.attr}"
+                    data["defs"][field] = getattr(n, 'lineno', 0)
+                    for src in rhs_names:
+                        data["field_dependencies"][field].append(src)
+
+            if isinstance(n.value, ast.Call):
+                if call_name in TAINT_SOURCES:
+                    data["taint"]["sources"].append({"line": getattr(n, 'lineno', 0), "call": call_name})
+                if any(key in call_name for key in SANITIZERS):
+                    data["taint"]["sanitizers"].append({"line": getattr(n, 'lineno', 0), "call": call_name})
+
+        if isinstance(n, ast.Call):
+            cname = _name_from_call(n)
+            arg_names = {x.id for a in n.args for x in ast.walk(a) if isinstance(x, ast.Name)}
+            if cname in TAINT_SINKS:
+                data["taint"]["sinks"].append({"line": getattr(n, 'lineno', 0), "call": cname})
+                if any(a in tainted for a in arg_names):
+                    data["taint"]["vulnerabilities"].append({
+                        "line": getattr(n, 'lineno', 0),
+                        "sink": cname,
+                        "tainted_args": sorted([a for a in arg_names if a in tainted])
+                    })
+
+        if isinstance(n, ast.Return):
+            names = [x.id for x in ast.walk(n.value) if isinstance(x, ast.Name)] if n.value else []
+            data["return_flows"].append({"line": getattr(n, 'lineno', 0), "vars": names})
+
+        if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Load):
+            data["uses"][n.id].append(getattr(n, 'lineno', 0))
+
+        if isinstance(n, ast.Attribute) and isinstance(n.value, ast.Name):
+            key = f"{n.value.id}.{n.attr}"
+            data["uses"][key].append(getattr(n, 'lineno', 0))
+
+    return {
+        "defs": dict(data["defs"]),
+        "uses": {k: v for k, v in data["uses"].items()},
+        "edges": data["edges"],
+        "return_flows": data["return_flows"],
+        "field_dependencies": {k: v for k, v in data["field_dependencies"].items()},
+        "taint": data["taint"]
+    }
+
+
+def _symbolic_execution_preview(code: str) -> Dict[str, Any]:
+    """Lightweight symbolic execution preview with simple path constraints."""
+    tree = _safe_ast_parse(code)
+    if tree is None:
+        return {"constraints": [], "symbols": []}
+    constraints, symbols = [], set()
+    for n in ast.walk(tree):
+        if isinstance(n, ast.If):
+            cond = ast.unparse(n.test) if hasattr(ast, 'unparse') else 'condition'
+            constraints.append(cond)
+            for name in [x.id for x in ast.walk(n.test) if isinstance(x, ast.Name)]:
+                symbols.add(name)
+    return {"constraints": constraints[:40], "symbols": sorted(symbols)}
+
+
+def _generate_boundary_test_inputs(arg_names: List[str], arg_types: List[str]) -> List[Dict[str, Any]]:
+    """Generate basic boundary test payloads for runtime simulation."""
+    if not arg_names:
+        return []
+    samples = []
+    base = {}
+    for i, arg in enumerate(arg_names):
+        typ = (arg_types[i] if i < len(arg_types) else '').lower()
+        if 'int' in typ:
+            base[arg] = 0
+        elif 'float' in typ:
+            base[arg] = 0.0
+        elif 'bool' in typ:
+            base[arg] = False
+        else:
+            base[arg] = ""
+    samples.append(dict(base))
+    alt = {}
+    for i, arg in enumerate(arg_names):
+        typ = (arg_types[i] if i < len(arg_types) else '').lower()
+        if 'int' in typ:
+            alt[arg] = 1
+        elif 'float' in typ:
+            alt[arg] = 1.5
+        elif 'bool' in typ:
+            alt[arg] = True
+        else:
+            alt[arg] = "boundary"
+    samples.append(alt)
+    return samples
+
+
+def _extract_param_bindings(code: str) -> Dict[str, str]:
+    tree = _safe_ast_parse(code)
+    if tree is None:
+        return {}
+    for n in tree.body:
+        if isinstance(n, ast.FunctionDef):
+            return {a.arg: a.arg for a in n.args.args}
+    return {}
+
+
+def _infer_security_role(node_data: Dict[str, Any]) -> str:
+    code = (node_data.get('code') or '').lower()
+    decorators = [d.lower() for d in node_data.get('decorators', [])]
+    if any(tok in code for tok in ["request.", "input(", "sys.argv"]):
+        return "source"
+    if any(tok in code for tok in ["execute(", "eval(", "exec(", "os.system("]):
+        return "sink"
+    if any(tok in code for tok in ["sanitize", "escape", "validate"]):
+        return "sanitizer"
+    if any("auth" in d or "login_required" in d or "requires_auth" in d for d in decorators):
+        return "auth_boundary"
+    return "neutral"
+
+
+def _build_package_dependency_metadata(files_data: Dict[str, Dict[str, str]]) -> Dict[str, Any]:
+    out = {"package_json": {}, "requirements": {}, "all": {}}
+    if 'package.json' in files_data:
+        try:
+            pkg = json.loads(files_data['package.json']['content'])
+            out['package_json'] = {
+                **pkg.get('dependencies', {}),
+                **pkg.get('devDependencies', {})
+            }
+        except Exception:
+            pass
+    if 'requirements.txt' in files_data:
+        reqs = {}
+        for line in files_data['requirements.txt']['content'].splitlines():
+            line = line.strip()
+            if not line or line.startswith('#'):
+                continue
+            if '==' in line:
+                k, v = line.split('==', 1)
+                reqs[k.strip()] = v.strip()
+            else:
+                reqs[line] = '*'
+        out['requirements'] = reqs
+
+    merged = {}
+    merged.update(out['package_json'])
+    merged.update(out['requirements'])
+    out['all'] = merged
+    return out
+
+
+def _track_symbol_refactors(active_graph: Dict[str, Dict], previous_graph: Optional[Dict[str, Dict]]):
+    if not previous_graph:
+        return
+    prev_by_hash = defaultdict(list)
+    for old_id, old_node in previous_graph.items():
+        prev_by_hash[old_node.get('node_hash', '')].append((old_id, old_node))
+
+    for nid, node in active_graph.items():
+        nh = node.get('node_hash', '')
+        if not nh or nid in previous_graph:
+            continue
+        cands = prev_by_hash.get(nh, [])
+        if cands:
+            node['previous_identity'] = cands[0][0]
+
+
+def _load_reasoning_memory() -> List[Dict[str, Any]]:
+    if not os.path.exists(MEMORY_FILE):
+        return []
+    try:
+        with open(MEMORY_FILE, 'r') as f:
+            data = json.load(f)
+            return data if isinstance(data, list) else []
+    except Exception:
+        return []
+
+
+def _save_reasoning_memory(entries: List[Dict[str, Any]]):
+    os.makedirs(CACHE_DIR, exist_ok=True)
+    with open(MEMORY_FILE, 'w') as f:
+        json.dump(entries[-200:], f, indent=2)
+
+
+def _find_memory_match(query: str, threshold: float = 0.84) -> Optional[Dict[str, Any]]:
+    best, best_score = None, 0.0
+    for item in _load_reasoning_memory():
+        q = item.get('query', '')
+        score = SequenceMatcher(None, query.lower(), q.lower()).ratio()
+        if score > best_score:
+            best, best_score = item, score
+    if best and best_score >= threshold:
+        return best
+    return None
+
+
+def _record_reasoning_memory(query: str, selected_nodes: List[str], answer: str):
+    entries = _load_reasoning_memory()
+    entries.append({"query": query, "selected_nodes": selected_nodes[:80], "answer": answer[:3000], "ts": time.time()})
+    _save_reasoning_memory(entries)
+
+
+def export_graph_visualizations(multi_graph: Dict[str, Dict], output_dir: str = VISUALIZATION_DIR):
+    os.makedirs(output_dir, exist_ok=True)
+    for repo, graph in multi_graph.items():
+        symbol_dot = ["digraph SymbolGraph {"]
+        for nid, node in graph.items():
+            label = node.get('symbol', {}).get('name', nid.split('::')[-1]).replace('"', "'")
+            symbol_dot.append(f'  "{nid}" [label="{label}"];')
+            for dep in node.get('dependencies', []):
+                if dep in graph:
+                    symbol_dot.append(f'  "{nid}" -> "{dep}";')
+        symbol_dot.append("}")
+        with open(os.path.join(output_dir, f"{repo}_symbol.dot"), 'w') as f:
+            f.write("\n".join(symbol_dot))
+
+        for nid, node in list(graph.items())[:40]:
+            dfg = node.get('dfg', {})
+            cfg = node.get('cfg', {})
+            if dfg.get('edges'):
+                dfg_dot = ["digraph DFG {"]
+                for src, dst in dfg.get('edges', [])[:200]:
+                    dfg_dot.append(f'  "{src}" -> "{dst}";')
+                dfg_dot.append("}")
+                with open(os.path.join(output_dir, f"{repo}_{hashlib.md5(nid.encode()).hexdigest()[:10]}_dfg.dot"), 'w') as f:
+                    f.write("\n".join(dfg_dot))
+            if cfg.get('edges'):
+                cfg_dot = ["digraph CFG {"]
+                for b in cfg.get('blocks', []):
+                    cfg_dot.append(f'  "{b.get("id")}" [label="{b.get("kind")}@{b.get("lineno")}"];')
+                for src, dst in cfg.get('edges', [])[:200]:
+                    cfg_dot.append(f'  "{src}" -> "{dst}";')
+                cfg_dot.append("}")
+                with open(os.path.join(output_dir, f"{repo}_{hashlib.md5(nid.encode()).hexdigest()[:10]}_cfg.dot"), 'w') as f:
+                    f.write("\n".join(cfg_dot))
 
 def _extract_external_lib_from_import(import_stmt: str) -> Optional[str]:
     """Extract external library/module root from common import syntaxes."""
@@ -2382,6 +2762,10 @@ async def build_single_repo_graph(
                         if target_id != node_id:
                             valid_deps.append(target_id)
 
+            node_dfg = _extract_python_data_flow(node['code']) if filename.endswith('.py') else {"defs": {}, "uses": {}, "edges": [], "return_flows": [], "field_dependencies": {}, "taint": {"sources": [], "sinks": [], "sanitizers": [], "vulnerabilities": []}}
+            node_cfg = _extract_python_cfg(node['code']) if filename.endswith('.py') else {"blocks": [], "edges": []}
+            node_types = _extract_type_awareness(node['code']) if filename.endswith('.py') else {"type_registry": {}, "interface_links": [], "generic_usages": [], "field_links": {}}
+
             graph[node_id] = {
                 "repo": repo_name,
                 "symbol": {"repo": repo_name, "file": filename, "name": sym_name},
@@ -2409,7 +2793,16 @@ async def build_single_repo_graph(
                 "node_hash": "",
                 "pagerank": 0.0,
                 "centrality_score": 0.0,
-                "cross_repo_deps": []
+                "cross_repo_deps": [],
+                "dfg": node_dfg,
+                "cfg": node_cfg,
+                "type_info": node_types,
+                "param_bindings": _extract_param_bindings(node['code']) if filename.endswith('.py') else {},
+                "symbolic_execution": _symbolic_execution_preview(node['code']) if filename.endswith('.py') else {"constraints": [], "symbols": []},
+                "test_inputs": _generate_boundary_test_inputs(node.get('arg_names', []), node.get('arg_types', [])),
+                "security_role": "",
+                "requires_auth": any('auth' in (d or '').lower() or 'login_required' in (d or '').lower() for d in node.get('decorators', [])),
+                "previous_identity": None
             }
 
     for filename in files_to_reparse:
@@ -2443,7 +2836,14 @@ async def build_single_repo_graph(
                 "node_hash": "",
                 "pagerank": 0.0,
                 "centrality_score": 0.0,
-                "cross_repo_deps": []
+                "cross_repo_deps": [],
+                "dfg": {"defs": {}, "uses": {}, "edges": [], "return_flows": [], "field_dependencies": {}, "taint": {"sources": [], "sinks": [], "sanitizers": [], "vulnerabilities": []}},
+                "cfg": {"blocks": [], "edges": []},
+                "type_info": {"type_registry": {}, "interface_links": [], "generic_usages": [], "field_links": {}},
+                "param_bindings": {},
+                "security_role": "neutral",
+                "requires_auth": False,
+                "previous_identity": None
             }
 
     for filename in files_data.keys():
@@ -2477,7 +2877,14 @@ async def build_single_repo_graph(
                 "node_hash": "",
                 "pagerank": 0.0,
                 "centrality_score": 0.0,
-                "cross_repo_deps": []
+                "cross_repo_deps": [],
+                "dfg": {"defs": {}, "uses": {}, "edges": [], "return_flows": [], "field_dependencies": {}, "taint": {"sources": [], "sinks": [], "sanitizers": [], "vulnerabilities": []}},
+                "cfg": {"blocks": [], "edges": []},
+                "type_info": {"type_registry": {}, "interface_links": [], "generic_usages": [], "field_links": {}},
+                "param_bindings": {},
+                "security_role": "neutral",
+                "requires_auth": False,
+                "previous_identity": None
             }
 
     folder_children = defaultdict(set)
@@ -2533,7 +2940,16 @@ async def build_single_repo_graph(
             "node_hash": "",
             "pagerank": 0.0,
             "centrality_score": 0.0,
-            "cross_repo_deps": []
+            "cross_repo_deps": [],
+            "dfg": {"defs": {}, "uses": {}, "edges": [], "return_flows": [], "field_dependencies": {}, "taint": {"sources": [], "sinks": [], "sanitizers": [], "vulnerabilities": []}},
+            "cfg": {"blocks": [], "edges": []},
+            "type_info": {"type_registry": {}, "interface_links": [], "generic_usages": [], "field_links": {}},
+            "param_bindings": {},
+            "symbolic_execution": {"constraints": [], "symbols": []},
+            "test_inputs": [],
+            "security_role": "neutral",
+            "requires_auth": False,
+            "previous_identity": None
         }
 
     class_name_to_ids = defaultdict(list)
@@ -2613,10 +3029,84 @@ async def build_single_repo_graph(
             if target_id in graph and source_id not in graph[target_id]['callers']:
                 graph[target_id]['callers'].append(source_id)
 
+    # Inter-procedural variable flow: map caller argument names -> callee params.
+    for source_id, source_data in graph.items():
+        for dep_id in source_data.get('dependencies', []):
+            dep_node = graph.get(dep_id)
+            if not dep_node:
+                continue
+            callee_params = dep_node.get('arg_names', [])
+            caller_vars = []
+            for v in source_data.get('dfg', {}).get('uses', {}).keys():
+                if isinstance(v, str) and re.match(r'^[a-zA-Z_][a-zA-Z0-9_]*$', v):
+                    caller_vars.append(v)
+            bindings = {}
+            for idx, param in enumerate(callee_params):
+                if idx < len(caller_vars):
+                    bindings[param] = caller_vars[idx]
+            if bindings:
+                dep_node.setdefault('param_bindings', {}).update(bindings)
+
+    # Type/security enrichments and defaults
+    for nid, ndata in graph.items():
+        ndata.setdefault('dfg', {"defs": {}, "uses": {}, "edges": [], "return_flows": [], "field_dependencies": {}, "taint": {"sources": [], "sinks": [], "sanitizers": [], "vulnerabilities": []}})
+        ndata.setdefault('cfg', {"blocks": [], "edges": []})
+        ndata.setdefault('type_info', {"type_registry": {}, "interface_links": [], "generic_usages": [], "field_links": {}})
+        ndata.setdefault('param_bindings', {})
+        ndata.setdefault('previous_identity', None)
+        ndata.setdefault('symbolic_execution', {"constraints": [], "symbols": []})
+        ndata.setdefault('test_inputs', _generate_boundary_test_inputs(ndata.get('arg_names', []), ndata.get('arg_types', [])))
+        ndata['security_role'] = _infer_security_role(ndata)
+        if ndata.get('security_role') == 'auth_boundary':
+            ndata['requires_auth'] = True
+
+    # Add package-level dependency graph node.
+    pkg_meta = _build_package_dependency_metadata(files_data)
+    pkg_node_id = "package::dependencies"
+    graph[pkg_node_id] = {
+        "repo": repo_name,
+        "symbol": {"repo": repo_name, "file": "package-manifest", "name": "package_dependencies"},
+        "file": "package-manifest",
+        "code": json.dumps(pkg_meta, ensure_ascii=False)[:4000],
+        "type": "package_dependencies",
+        "globals": "",
+        "dependencies": [],
+        "inherits": [],
+        "callers": [],
+        "api_route": None,
+        "api_outbound": [],
+        "docstring": "Dependency manifest extracted from package.json / requirements.txt",
+        "comments_above": "",
+        "comment_ratio": 0.0,
+        "comment_quality": 0.0,
+        "arg_names": [],
+        "arg_types": [],
+        "return_type": None,
+        "variable_mentions": [],
+        "exception_types": [],
+        "decorators": [],
+        "bases": [],
+        "global_id": _global_node_id(repo_name, "package-manifest", "package_dependencies"),
+        "node_hash": "",
+        "pagerank": 0.0,
+        "centrality_score": 0.0,
+        "cross_repo_deps": [],
+        "dfg": {"defs": {}, "uses": {}, "edges": [], "return_flows": [], "field_dependencies": {}, "taint": {"sources": [], "sinks": [], "sanitizers": [], "vulnerabilities": []}},
+        "cfg": {"blocks": [], "edges": []},
+        "type_info": {"type_registry": {}, "interface_links": [], "generic_usages": [], "field_links": {}},
+        "param_bindings": {},
+        "security_role": "neutral",
+        "requires_auth": False,
+        "previous_identity": None,
+        "package_dependencies": pkg_meta
+    }
+
     _compute_graph_centrality(graph)
 
     for nid, ndata in graph.items():
         ndata['node_hash'] = _compute_node_content_hash(ndata)
+
+    _track_symbol_refactors(graph, previous_graph)
 
     print(f"   ✅ Built graph for [{repo_name}]: {len(graph)} nodes")
     return graph, resolver
@@ -2662,6 +3152,23 @@ def link_cross_repo_dependencies(multi_graph: Dict[str, Dict]) -> Dict[str, Dict
         print(f"   🔗 Established {count_links} cross-repo API connections")
     
     return multi_graph
+
+def _detect_dependency_version_conflicts(multi_graph: Dict[str, Dict]) -> List[Dict[str, Any]]:
+    seen = defaultdict(list)
+    for repo, graph in multi_graph.items():
+        pkg_node = graph.get('package::dependencies')
+        if not pkg_node:
+            continue
+        for dep, ver in (pkg_node.get('package_dependencies', {}).get('all', {}) or {}).items():
+            seen[dep].append((repo, str(ver)))
+
+    conflicts = []
+    for dep, vals in seen.items():
+        versions = sorted(set(v for _, v in vals))
+        if len(versions) > 1:
+            conflicts.append({"dependency": dep, "versions": versions, "repos": vals})
+    return conflicts
+
 
 async def build_multi_symbol_graph(
     multi_repo_data: Dict[str, Dict],
@@ -2713,6 +3220,13 @@ async def build_multi_symbol_graph(
         resolvers[repo_name] = resolver
 
     multi_graph = link_cross_repo_dependencies(multi_graph)
+    dep_conflicts = _detect_dependency_version_conflicts(multi_graph)
+    if dep_conflicts:
+        print(f"⚠️ Dependency version conflicts detected: {len(dep_conflicts)}")
+        for c in dep_conflicts[:20]:
+            print(f"   - {c['dependency']}: {', '.join(c['versions'])}")
+            for repo, ver in c.get('repos', []):
+                print(f"      · {repo}: {ver}")
     await summarizer.generate_project_overview(multi_graph)
 
     vector_stores = {}
@@ -2758,6 +3272,11 @@ async def build_multi_symbol_graph(
 
     with open(GRAPH_FILE, 'w') as f:
         json.dump(multi_graph, f, indent=2)
+
+    try:
+        export_graph_visualizations(multi_graph, VISUALIZATION_DIR)
+    except Exception as vis_err:
+        print(f"⚠️ Visualization export failed: {vis_err}")
 
     return multi_graph, vector_stores
 
@@ -3006,6 +3525,7 @@ async def selector_agent_enhanced(
     summarizer: ProjectSummarizer = None
 ) -> List[str]:
     """Enhanced selector using vector search, graph traversal, and summaries."""
+    global LAST_SELECTOR_NODES
     print(f"🗂️ Selector: Strategy [{query_type}] in [{target_repo}]...", flush=True)
     
     if target_repo == "ALL" or target_repo not in multi_graph:
@@ -3034,6 +3554,14 @@ async def selector_agent_enhanced(
     if not active_graph and query_type != "HIGH_LEVEL":
         return []
 
+    memory_match = _find_memory_match(technical_query)
+    if memory_match and active_graph:
+        mem_nodes = set(n for n in memory_match.get('selected_nodes', []) if n in active_graph)
+        if mem_nodes:
+            print("   🧠 Reusing memory-augmented retrieval hints")
+            LAST_SELECTOR_NODES = list(mem_nodes)
+            return build_context_with_budget(mem_nodes, active_graph, target_repo)
+
     if query_type == "IMPACT" and active_graph:
         specific_seeds = _extract_specific_targets(technical_query, hints or [], active_graph)
         if not specific_seeds:
@@ -3051,6 +3579,7 @@ async def selector_agent_enhanced(
                         elif result_id in active_graph:
                             specific_seeds.add(result_id)
         if specific_seeds:
+            LAST_SELECTOR_NODES = list(specific_seeds)
             return _get_blast_radius(next(iter(specific_seeds)), active_graph, max_depth=3)
 
     selected_nodes = set()
@@ -3140,6 +3669,7 @@ async def selector_agent_enhanced(
         path_nodes = _find_shortest_path_nodes(active_graph, endpoint_candidates, db_candidates)
         selected_nodes.update(path_nodes)
 
+    LAST_SELECTOR_NODES = list(selected_nodes)
     context_strings = build_context_with_budget(selected_nodes, active_graph, target_repo)
     return extra_context + context_strings
 
@@ -3293,12 +3823,16 @@ async def autonomous_answering_loop(
 
         assessment = await llm_assess_context(user_query, context_pool)
         if assessment.get("status") == "ANSWERABLE":
-            return await answering_agent(user_query, context_pool)
+            answer = await answering_agent(user_query, context_pool)
+            _record_reasoning_memory(user_query, LAST_SELECTOR_NODES, answer)
+            return answer
 
         active_query = assessment.get("missing_info_query") or active_query
 
     if context_pool:
-        return await answering_agent(user_query, context_pool)
+        answer = await answering_agent(user_query, context_pool)
+        _record_reasoning_memory(user_query, LAST_SELECTOR_NODES, answer)
+        return answer
     return "I tried multiple retrieval passes but could not find enough evidence to answer confidently."
 
 def compress_context_strings(context_strings: List[str], token_budget: int = CONTEXT_COMPRESSION_TRIGGER_TOKENS) -> List[str]:
