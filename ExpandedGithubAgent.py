@@ -2143,6 +2143,27 @@ def _priority_graph_traverse(
 
     return selected
 
+
+def _caller_traverse(seed_nodes: Set[str], active_graph: Dict, max_depth: int = 2) -> Set[str]:
+    """Traverse reverse edges to find who calls the seed nodes."""
+    selected = set(seed_nodes)
+    queue = list(seed_nodes)
+    depth = 0
+
+    while queue and depth < max_depth:
+        next_queue = []
+        for node_id in queue:
+            node = active_graph.get(node_id)
+            if not node:
+                continue
+            for caller_id in node.get('callers', []):
+                if caller_id in active_graph and caller_id not in selected:
+                    selected.add(caller_id)
+                    next_queue.append(caller_id)
+        queue = next_queue
+        depth += 1
+    return selected
+
 async def selector_agent_enhanced(
     target_repo: str,
     technical_query: str,
