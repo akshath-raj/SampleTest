@@ -91,6 +91,12 @@ try:
 except ImportError:
     HAS_FAISS = False
 
+try:
+    import networkx as nx
+    HAS_NETWORKX = True
+except ImportError:
+    HAS_NETWORKX = False
+
 # Jupyter notebook support
 try:
     import nbformat
@@ -124,6 +130,14 @@ TOP_K_SEEDS = 5
 BACKWARD_TRAVERSAL_DEPTH = 3
 INCLUDE_HIGH_LEVEL_CONTEXT = True
 MAX_SUMMARY_TOKENS = 4000
+MAX_REASONING_TURNS = 4
+
+# Retrieval weighting configuration
+COMMENT_MATCH_WEIGHT = 0.2
+COMMENT_DENSITY_WEIGHT = 0.1
+INTENT_SIMILARITY_WEIGHT = 0.6
+CODE_SIMILARITY_WEIGHT = 0.3
+GRAPH_PROXIMITY_WEIGHT = 0.1
 
 # Retrieval weighting configuration
 COMMENT_MATCH_WEIGHT = 0.2
@@ -319,6 +333,75 @@ def _global_node_id(repo: str, file_path: str, symbol_name: str) -> str:
     """Stable globally unique node id across repositories."""
     return f"gid::{repo}::{file_path}::{symbol_name}"
 
+
+def _extract_python_semantic_metadata(code: str) -> Dict[str, Any]:
+    """Extract lightweight data-flow related metadata from Python functions."""
+    meta = {
+        "arg_names": [],
+        "arg_types": [],
+        "return_type": None,
+        "variable_mentions": [],
+        "exception_types": [],
+        "decorators": []
+    }
+    try:
+        tree = ast.parse(code)
+        if not tree.body:
+            return meta
+        node = tree.body[0]
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            meta["arg_names"] = [a.arg for a in node.args.args]
+            meta["arg_types"] = [ast.unparse(a.annotation) for a in node.args.args if getattr(a, 'annotation', None)]
+            if node.returns:
+                meta["return_type"] = ast.unparse(node.returns)
+            meta["decorators"] = [ast.unparse(d) for d in node.decorator_list]
+            var_names = set()
+            exc_types = set()
+            for sub in ast.walk(node):
+                if isinstance(sub, ast.Name):
+                    var_names.add(sub.id)
+                elif isinstance(sub, ast.ExceptHandler) and sub.type is not None:
+                    try:
+                        exc_types.add(ast.unparse(sub.type))
+                    except Exception:
+                        pass
+            meta["variable_mentions"] = sorted(var_names)[:50]
+            meta["exception_types"] = sorted(exc_types)
+    except Exception:
+        pass
+    return meta
+
+
+def reconstruct_file_slice(file_globals: str, nodes: List[Dict[str, Any]]) -> str:
+    """Build a compact program slice from globals + selected symbols."""
+    block = ""
+    if file_globals:
+        block += "--- FILE GLOBALS, IMPORTS AND CONSTANTS ---\n"
+        block += file_globals
+        block += "\n" + "=" * 60 + "\n"
+        block += "# RELEVANT SYMBOL SLICES\n"
+        block += "=" * 60 + "\n\n"
+
+    # Prefer higher-quality documentation and smaller focused blocks.
+    ordered = sorted(
+        nodes,
+        key=lambda n: (
+            float(n.get('comment_quality', 0.0)),
+            float(n.get('comment_ratio', 0.0)),
+            -len(n.get('code', ''))
+        ),
+        reverse=True
+    )
+
+    for node in ordered:
+        symbol_name = node.get('symbol', {}).get('name', node.get('name', 'unknown'))
+        block += f"// Symbol: {symbol_name} | Type: {node.get('type', 'function')}\n"
+        if node.get('docstring'):
+            block += f"// Doc: {node.get('docstring', '')[:180]}\n"
+        block += node.get('code', '')
+        block += "\n\n"
+
+    return block.strip()
 
 
 def compute_file_content_hash(content: str) -> str:
@@ -903,6 +986,7 @@ class TreeSitterParser:
                     api_route = self._extract_python_route(node, content)
                     api_calls = self._extract_api_calls(code)
                     comment_meta = self._extract_symbol_docs(node, content, code, 'python')
+                    semantic_meta = _extract_python_semantic_metadata(code)
                     
                     nodes.append({
                         "name": full_name,
@@ -911,7 +995,8 @@ class TreeSitterParser:
                         "calls": calls,
                         "api_route": api_route,
                         "api_outbound": api_calls,
-                        **comment_meta
+                        **comment_meta,
+                        **semantic_meta
                     })
             
             elif node.type == 'class_definition':
@@ -1458,6 +1543,7 @@ class ProjectSummarizer:
     def __init__(self, model_name: str = MODEL_NAME):
         self.model_name = model_name
         self.file_summaries = {}
+        self.folder_summaries = {}
         self.project_summary = ""
 
     async def summarize_file(self, filename: str, content: str, nodes: List[Dict]) -> str:
@@ -1483,6 +1569,39 @@ Content Preview: {content[:1000]}
         except Exception as e:
             print(f"   ⚠️ Summary failed for {filename}: {e}")
             return f"Module containing {node_str}"
+
+    async def build_hierarchical_summaries(self, repo_name: str, files_data: Dict[str, Dict]):
+        """Build folder-level summaries from file summaries (hierarchical map)."""
+        folder_to_files = defaultdict(list)
+        for filename in files_data.keys():
+            folder = os.path.dirname(filename) or "."
+            folder_to_files[folder].append(filename)
+
+        # Bottom-up summarization by folder depth.
+        for folder in sorted(folder_to_files.keys(), key=lambda f: f.count('/'), reverse=True):
+            file_summaries = [self.file_summaries.get(f, "Source file") for f in folder_to_files[folder][:20]]
+            child_folders = [f for f in folder_to_files.keys() if f != folder and f.startswith(folder + "/") and f.count('/') == folder.count('/') + 1]
+            child_summaries = [self.folder_summaries.get(f"{repo_name}:{cf}", "") for cf in child_folders[:10]]
+
+            composed = "\n".join([f"- {s}" for s in file_summaries + child_summaries if s])
+            if not composed:
+                composed = "- Source code folder"
+
+            prompt = f"""
+Summarize this folder in 1-2 concise sentences.
+Repository: {repo_name}
+Folder: {folder}
+Contained Summaries:
+{composed[:2500]}
+"""
+            try:
+                res = await safe_chat_completion(
+                    model=self.model_name,
+                    messages=[{"role": "user", "content": prompt}]
+                )
+                self.folder_summaries[f"{repo_name}:{folder}"] = res.choices[0].message.content.strip()
+            except Exception:
+                self.folder_summaries[f"{repo_name}:{folder}"] = f"Folder containing {len(folder_to_files[folder])} files"
 
     async def generate_project_overview(self, multi_graph: Dict[str, Dict]) -> str:
         """Synthesize project-level architecture summary."""
@@ -1525,6 +1644,7 @@ Keep it under 3-4 paragraphs.
         """Save summaries to disk."""
         data = {
             "file_summaries": self.file_summaries,
+            "folder_summaries": self.folder_summaries,
             "project_summary": self.project_summary
         }
         with open(filepath, 'w') as f:
@@ -1536,6 +1656,7 @@ Keep it under 3-4 paragraphs.
             with open(filepath, 'r') as f:
                 data = json.load(f)
                 self.file_summaries = data.get("file_summaries", {})
+                self.folder_summaries = data.get("folder_summaries", {})
                 self.project_summary = data.get("project_summary", "")
 
 # --- 4. Import Resolution System ---
@@ -1840,7 +1961,13 @@ async def build_single_repo_graph(repo_name: str, files_data: Dict[str, Dict]) -
                 "docstring": node.get('docstring', ''),
                 "comments_above": node.get('comments_above', ''),
                 "comment_ratio": node.get('comment_ratio', 0.0),
-                "comment_quality": node.get('comment_quality', 0.0)
+                "comment_quality": node.get('comment_quality', 0.0),
+                "arg_names": node.get('arg_names', []),
+                "arg_types": node.get('arg_types', []),
+                "return_type": node.get('return_type'),
+                "variable_mentions": node.get('variable_mentions', []),
+                "exception_types": node.get('exception_types', []),
+                "decorators": node.get('decorators', [])
             })
     
     graph = {}
@@ -1886,6 +2013,12 @@ async def build_single_repo_graph(repo_name: str, files_data: Dict[str, Dict]) -
                 "comments_above": impl.get('comments_above', ''),
                 "comment_ratio": impl.get('comment_ratio', 0.0),
                 "comment_quality": impl.get('comment_quality', 0.0),
+                "arg_names": impl.get('arg_names', []),
+                "arg_types": impl.get('arg_types', []),
+                "return_type": impl.get('return_type'),
+                "variable_mentions": impl.get('variable_mentions', []),
+                "exception_types": impl.get('exception_types', []),
+                "decorators": impl.get('decorators', []),
                 "global_id": _global_node_id(repo_name, impl['file'], impl.get('symbol', sym_name)),
                 "cross_repo_deps": []
             }
@@ -1914,10 +2047,68 @@ async def build_single_repo_graph(repo_name: str, files_data: Dict[str, Dict]) -
                 "comments_above": "",
                 "comment_ratio": 0.0,
                 "comment_quality": 0.0,
+                "arg_names": [],
+                "arg_types": [],
+                "return_type": None,
+                "variable_mentions": [],
+                "exception_types": [],
+                "decorators": [],
                 "global_id": _global_node_id(repo_name, filename, "module"),
                 "cross_repo_deps": []
             }
     
+    # Build hierarchical folder nodes (folder -> contains file/module/function nodes)
+    folder_children = defaultdict(set)
+    file_root_nodes = defaultdict(list)
+    for nid, ndata in graph.items():
+        file_root_nodes[ndata['file']].append(nid)
+
+    for filename in files_data.keys():
+        folder = os.path.dirname(filename) or "."
+        current = folder
+        prev = None
+        while True:
+            folder_key = f"folder::{current}"
+            if prev is not None:
+                folder_children[folder_key].add(f"folder::{prev}")
+            prev = current
+            if current in ("", "."):
+                break
+            current = os.path.dirname(current) or "."
+
+        leaf_folder = f"folder::{folder}"
+        for node_id in file_root_nodes.get(filename, []):
+            folder_children[leaf_folder].add(node_id)
+
+    for folder_key, children in folder_children.items():
+        folder_path = folder_key.replace("folder::", "")
+        folder_node_id = f"{folder_key}::node"
+        graph[folder_node_id] = {
+            "repo": repo_name,
+            "symbol": {"repo": repo_name, "file": folder_path, "name": folder_key},
+            "file": folder_path,
+            "code": "",
+            "type": "folder",
+            "globals": "",
+            "dependencies": [],
+            "callers": [],
+            "contains": sorted(children),
+            "api_route": None,
+            "api_outbound": [],
+            "docstring": "",
+            "comments_above": "",
+            "comment_ratio": 0.0,
+            "comment_quality": 0.0,
+            "arg_names": [],
+            "arg_types": [],
+            "return_type": None,
+            "variable_mentions": [],
+            "exception_types": [],
+            "decorators": [],
+            "global_id": _global_node_id(repo_name, folder_path, folder_key),
+            "cross_repo_deps": []
+        }
+
     # Populate reverse dependency edges (callers)
     for source_id, source_data in graph.items():
         for target_id in source_data.get('dependencies', []):
@@ -2007,6 +2198,7 @@ async def build_multi_symbol_graph(
                 await summarizer.summarize_file(fname, data['content'], symbol_names)
 
         await asyncio.gather(*[_summarize_one(filename, data) for filename, data in files_data.items()])
+        await summarizer.build_hierarchical_summaries(repo_name, files_data)
 
         multi_graph[repo_name] = graph
         resolvers[repo_name] = resolver
@@ -2144,25 +2336,42 @@ def _priority_graph_traverse(
     return selected
 
 
-def _caller_traverse(seed_nodes: Set[str], active_graph: Dict, max_depth: int = 2) -> Set[str]:
-    """Traverse reverse edges to find who calls the seed nodes."""
-    selected = set(seed_nodes)
-    queue = list(seed_nodes)
-    depth = 0
+def _build_nx_graph(active_graph: Dict[str, Dict]) -> Optional[Any]:
+    if not HAS_NETWORKX:
+        return None
+    g = nx.DiGraph()
+    for node_id, node in active_graph.items():
+        g.add_node(node_id)
+        for dep in node.get('dependencies', []):
+            if dep in active_graph:
+                g.add_edge(node_id, dep)
+        for caller in node.get('callers', []):
+            if caller in active_graph:
+                g.add_edge(caller, node_id)
+    return g
 
-    while queue and depth < max_depth:
-        next_queue = []
-        for node_id in queue:
-            node = active_graph.get(node_id)
-            if not node:
+
+def _find_shortest_path_nodes(active_graph: Dict[str, Dict], source_candidates: List[str], target_candidates: List[str]) -> Set[str]:
+    if not HAS_NETWORKX:
+        return set()
+    graph = _build_nx_graph(active_graph)
+    if graph is None:
+        return set()
+
+    best_path = None
+    for src in source_candidates[:5]:
+        for dst in target_candidates[:5]:
+            if src not in graph or dst not in graph or src == dst:
                 continue
-            for caller_id in node.get('callers', []):
-                if caller_id in active_graph and caller_id not in selected:
-                    selected.add(caller_id)
-                    next_queue.append(caller_id)
-        queue = next_queue
-        depth += 1
-    return selected
+            try:
+                path = nx.shortest_path(graph, source=src, target=dst)
+                if best_path is None or len(path) < len(best_path):
+                    best_path = path
+            except Exception:
+                continue
+
+    return set(best_path or [])
+
 
 async def selector_agent_enhanced(
     target_repo: str,
@@ -2206,13 +2415,15 @@ async def selector_agent_enhanced(
     extra_context = []
     explanation_weight_mode = query_type == "HIGH_LEVEL" or bool(re.search(r"explain|how\s+.*works|architecture", technical_query, re.IGNORECASE))
 
-    # Strategy 1: HIGH_LEVEL - Include Project & File Summaries
+    # Strategy 1: HIGH_LEVEL - Include Project, File and Folder Summaries
     if query_type == "HIGH_LEVEL" and summarizer:
         extra_context.append(f"=== PROJECT ARCHITECTURAL OVERVIEW ===\n\n{summarizer.project_summary}")
-        # Also include top file summaries
         file_sum_str = "\n".join([f"- {f}: {s}" for f, s in list(summarizer.file_summaries.items())[:20]])
+        folder_sum_str = "\n".join([f"- {f}: {s}" for f, s in list(summarizer.folder_summaries.items())[:20]])
         extra_context.append(f"=== FILE SUMMARIES ===\n\n{file_sum_str}")
-        
+        if folder_sum_str:
+            extra_context.append(f"=== FOLDER SUMMARIES ===\n\n{folder_sum_str}")
+
     # Strategy 2: SPECIFIC - Backward traversal from hints
     if (query_type == "SPECIFIC" or hints) and active_graph:
         specific_seeds = _extract_specific_targets(technical_query, hints or [], active_graph)
@@ -2273,6 +2484,20 @@ async def selector_agent_enhanced(
             explanation_weight_mode=explanation_weight_mode
         ))
 
+    # Strategy 4: Multi-hop path retrieval for endpoint->db style queries.
+    if active_graph and re.search(r"endpoint|route|api", technical_query, re.IGNORECASE) and re.search(r"db|database|sql|repository", technical_query, re.IGNORECASE):
+        endpoint_candidates = []
+        db_candidates = []
+        for nid, node in active_graph.items():
+            blob = f"{nid} {node.get('file', '')} {node.get('code', '')[:200]}".lower()
+            if any(tok in blob for tok in ["route", "controller", "endpoint", "@app.", "router."]):
+                endpoint_candidates.append(nid)
+            if any(tok in blob for tok in ["db", "database", "sql", "repository", "query", "insert", "update"]):
+                db_candidates.append(nid)
+
+        path_nodes = _find_shortest_path_nodes(active_graph, endpoint_candidates, db_candidates)
+        selected_nodes.update(path_nodes)
+
     context_strings = build_context_with_budget(selected_nodes, active_graph, target_repo)
     return extra_context + context_strings
 
@@ -2317,60 +2542,122 @@ def build_context_with_budget(
     active_graph: Dict,
     target_repo: str
 ) -> List[str]:
-    """Build context strings with token budgeting."""
-    
-    files_context = defaultdict(lambda: {"globals": "", "functions": []})
+    """Build context strings with token budgeting using dynamic code slicing."""
 
-    for node_id in selected_nodes:
+    files_context = defaultdict(lambda: {"globals": "", "nodes": []})
+
+    # Pull immediate dependencies as slice support nodes (program slicing).
+    expanded_nodes = set(selected_nodes)
+    for node_id in list(selected_nodes):
+        node = active_graph.get(node_id)
+        if not node:
+            continue
+        for dep_id in node.get('dependencies', [])[:5]:
+            if dep_id in active_graph:
+                expanded_nodes.add(dep_id)
+
+    for node_id in expanded_nodes:
         if node_id not in active_graph:
             continue
-        
+
         node = active_graph[node_id]
-        
-        if target_repo == "ALL" and "::" in node_id:
-            parts = node_id.split("::")
-            repo_name = parts[0]
-            rel_file_path = node['file']
+        repo_name = node.get('repo', '')
+        rel_file_path = node.get('file', '')
+
+        if target_repo == "ALL":
             display_name = f"[{repo_name}] {rel_file_path}"
-            symbol_name = parts[-1]
         else:
-            rel_file_path = node['file']
             display_name = rel_file_path
-            symbol_name = node_id.split("::")[-1]
-        
-        # Globals now contain MUCH more info!
-        files_context[display_name]["globals"] = node['globals']
-        
-        # Add explicit metadata comment to the function code
-        metadata_comment = f"// File: {display_name} | Symbol: {symbol_name}\n"
-        if node['type'] == 'module':
-            metadata_comment = f"// File: {display_name} | (Full file content / No symbols found)\n"
-            
-        files_context[display_name]["functions"].append(metadata_comment + node['code'])
+
+        files_context[display_name]["globals"] = node.get('globals', '')
+        files_context[display_name]["nodes"].append(node)
 
     context_blocks = []
-
     for fname, data in files_context.items():
         block = f"############################################################\n"
         block += f"### FILE: {fname}\n"
-        block += f"### Symbols in this block: {len(data['functions'])}\n"
+        block += f"### Sliced symbols in this block: {len(data['nodes'])}\n"
         block += f"############################################################\n\n"
-        
-        # Show globals PROMINENTLY at the top
-        if data['globals']:
-            block += "--- FILE GLOBALS, IMPORTS AND CONSTANTS ---\n"
-            block += data['globals']
-            block += "\n" + "="*60 + "\n"
-            block += "# FUNCTION DEFINITIONS BELOW\n"
-            block += "="*60 + "\n\n"
-        
-        block += "\n\n".join(data['functions'])
+
+        block += reconstruct_file_slice(data['globals'], data['nodes'])
         block += "\n\n"
         context_blocks.append(block)
 
     budgeted_context = truncate_to_token_budget(context_blocks, MAX_CONTEXT_TOKENS)
-
     return budgeted_context
+
+
+async def llm_assess_context(user_query: str, context_strings: List[str]) -> Dict[str, Any]:
+    """Assess whether current retrieved context is sufficient to answer."""
+    preview = "\n\n".join(context_strings[:4])[:6000]
+    prompt = f"""
+You are a retrieval planner for a code reasoning system.
+User query: {user_query}
+Current context preview:
+{preview}
+
+Return strict JSON with:
+{{
+  "status": "ANSWERABLE" | "NEED_MORE_CONTEXT",
+  "missing_info_query": "targeted follow-up query if more context is needed",
+  "reason": "short reason"
+}}
+"""
+    try:
+        res = await safe_chat_completion(
+            model=MODEL_NAME,
+            messages=[{"role": "user", "content": prompt}],
+            response_format={"type": "json_object"}
+        )
+        return json.loads(res.choices[0].message.content)
+    except Exception:
+        return {"status": "NEED_MORE_CONTEXT", "missing_info_query": user_query, "reason": "fallback"}
+
+
+async def autonomous_answering_loop(
+    user_query: str,
+    reframer_res: Dict[str, Any],
+    multi_graph: Dict[str, Dict],
+    vector_stores: Dict[str, VectorEmbeddingStore],
+    summarizer: ProjectSummarizer,
+    max_turns: int = MAX_REASONING_TURNS
+) -> str:
+    """Agentic RAG loop: Plan -> Retrieve -> Evaluate -> Loop -> Answer."""
+    context_pool = []
+    seen = set()
+    active_query = reframer_res.get("query", user_query)
+
+    for turn in range(max_turns):
+        print(f"🔁 Reasoning turn {turn + 1}/{max_turns}...")
+
+        chunks = await selector_agent_enhanced(
+            reframer_res.get("target_repo", "ALL"),
+            active_query,
+            multi_graph,
+            vector_stores,
+            query_type=reframer_res.get("query_type", "FUNCTIONAL_AREA"),
+            hints=reframer_res.get("hints", []),
+            summarizer=summarizer
+        )
+
+        for chunk in chunks:
+            digest = hashlib.md5(chunk.encode('utf-8', errors='ignore')).hexdigest()
+            if digest not in seen:
+                seen.add(digest)
+                context_pool.append(chunk)
+
+        if not context_pool:
+            continue
+
+        assessment = await llm_assess_context(user_query, context_pool)
+        if assessment.get("status") == "ANSWERABLE":
+            return await answering_agent(user_query, context_pool)
+
+        active_query = assessment.get("missing_info_query") or active_query
+
+    if context_pool:
+        return await answering_agent(user_query, context_pool)
+    return "I tried multiple retrieval passes but could not find enough evidence to answer confidently."
 
 # --- Reframer ---
 
@@ -2606,21 +2893,14 @@ async def main():
             
             reframer_res = await reframer_agent(query, chat_history, available_repos)
             
-            context_strings = await selector_agent_enhanced(
-                reframer_res["target_repo"],
-                reframer_res["query"],
+            answer = await autonomous_answering_loop(
+                query,
+                reframer_res,
                 multi_graph,
                 vector_stores,
-                query_type=reframer_res["query_type"],
-                hints=reframer_res["hints"],
-                summarizer=summarizer
+                summarizer,
+                max_turns=MAX_REASONING_TURNS
             )
-            
-            if not context_strings:
-                print("   ⚠️ No relevant code found.")
-                continue
-            
-            answer = await answering_agent(query, context_strings)
             
             chat_history.append({"role": "user", "content": query})
             chat_history.append({"role": "assistant", "content": answer})
