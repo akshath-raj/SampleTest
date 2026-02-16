@@ -9,6 +9,7 @@ import re
 import ast
 import hashlib
 import time
+from difflib import SequenceMatcher
 from typing import List, Dict, Optional, Set, Any, Tuple
 from collections import defaultdict
 from git import Repo
@@ -142,6 +143,7 @@ CENTRALITY_WEIGHT = 0.2
 BM25_WEIGHT = 0.3
 EMBEDDING_WEIGHT = 0.5
 CONTEXT_COMPRESSION_TRIGGER_TOKENS = 22000
+LAST_SELECTOR_NODES: List[str] = []
 
 # Cache Configuration
 TENANT_ID = os.getenv("GITHUB_AGENT_TENANT", "default_tenant")
@@ -151,6 +153,8 @@ RUNTIME_ROOT = os.path.join("./runtime_data", TENANT_ID, SESSION_ID)
 CACHE_DIR = os.path.join(RUNTIME_ROOT, "pipeline_cache")
 CACHE_FILE = os.path.join(CACHE_DIR, "cache_metadata.json")
 GRAPH_FILE = os.path.join(CACHE_DIR, "symbol_graph.json")
+MEMORY_FILE = os.path.join(CACHE_DIR, "reasoning_memory.json")
+VISUALIZATION_DIR = os.path.join(RUNTIME_ROOT, "visualizations")
 
 if not OPENAI_API_KEY:
     print("⚠️ OPENAI_API_KEY not found in .env. Please set it.")
@@ -298,6 +302,393 @@ def _comment_keyword_overlap_score(query: str, comment_text: str) -> float:
 def _tokenize_for_sparse(text: str) -> List[str]:
     return re.findall(r"[a-zA-Z_][a-zA-Z0-9_]{1,}", (text or "").lower())
 
+
+def _normalize_scores(scores: Dict[str, float]) -> Dict[str, float]:
+    """Normalize arbitrary scores to [0, 1] range."""
+    if not scores:
+        return {}
+    min_val = min(scores.values())
+    max_val = max(scores.values())
+    if max_val == min_val:
+        return {k: 1.0 for k in scores.keys()}
+    return {k: (v - min_val) / (max_val - min_val) for k, v in scores.items()}
+
+
+TAINT_SOURCES = {"input", "request.get", "req.body", "request.args.get", "request.form.get", "request.json", "sys.argv"}
+TAINT_SINKS = {"db.execute", "cursor.execute", "eval", "exec", "subprocess.run", "os.system"}
+SANITIZERS = {"sanitize", "escape", "quote", "clean", "validate"}
+
+
+def _safe_ast_parse(code: str):
+    try:
+        return ast.parse(code or "")
+    except Exception:
+        return None
+
+
+def _name_from_call(call: ast.Call) -> str:
+    fn = call.func
+    if isinstance(fn, ast.Name):
+        return fn.id
+    if isinstance(fn, ast.Attribute):
+        base = ""
+        if isinstance(fn.value, ast.Name):
+            base = fn.value.id + "."
+        return f"{base}{fn.attr}"
+    return ""
+
+
+def _extract_type_awareness(code: str) -> Dict[str, Any]:
+    tree = _safe_ast_parse(code)
+    result = {
+        "type_registry": {},
+        "interface_links": [],
+        "generic_usages": [],
+        "field_links": {}
+    }
+    if tree is None:
+        return result
+
+    for n in ast.walk(tree):
+        if isinstance(n, ast.ClassDef):
+            fields = []
+            methods = []
+            for b in n.body:
+                if isinstance(b, ast.FunctionDef):
+                    methods.append(b.name)
+                if isinstance(b, ast.AnnAssign) and isinstance(b.target, ast.Name):
+                    fields.append(b.target.id)
+                if isinstance(b, ast.Assign):
+                    for t in b.targets:
+                        if isinstance(t, ast.Name):
+                            fields.append(t.id)
+            bases = [getattr(base, 'id', getattr(base, 'attr', '')) for base in n.bases]
+            result["type_registry"][n.name] = {"fields": sorted(set(fields)), "methods": sorted(set(methods)), "bases": bases}
+            for b in bases:
+                if b:
+                    result["interface_links"].append({"class": n.name, "implements": b})
+        if isinstance(n, ast.Subscript):
+            outer = getattr(n.value, 'id', getattr(n.value, 'attr', ''))
+            inner = ast.unparse(n.slice) if hasattr(ast, 'unparse') else ""
+            if outer and inner:
+                result["generic_usages"].append({"container": outer, "inner": inner})
+        if isinstance(n, ast.Attribute) and isinstance(n.value, ast.Name):
+            key = f"{n.value.id}.{n.attr}"
+            result["field_links"].setdefault(key, 0)
+            result["field_links"][key] += 1
+
+    return result
+
+
+def _extract_python_cfg(code: str) -> Dict[str, Any]:
+    tree = _safe_ast_parse(code)
+    if tree is None:
+        return {"blocks": [], "edges": []}
+
+    blocks, edges = [], []
+    block_id = 0
+
+    def add_block(kind: str, lineno: int) -> int:
+        nonlocal block_id
+        bid = block_id
+        block_id += 1
+        blocks.append({"id": bid, "kind": kind, "lineno": lineno})
+        return bid
+
+    prev = None
+    for stmt in tree.body:
+        kind = type(stmt).__name__
+        curr = add_block(kind, getattr(stmt, 'lineno', 0))
+        if prev is not None:
+            edges.append((prev, curr))
+        prev = curr
+
+        if isinstance(stmt, ast.If):
+            cond_id = curr
+            if stmt.body:
+                t_id = add_block("IfBody", getattr(stmt.body[0], 'lineno', 0))
+                edges.append((cond_id, t_id))
+            if stmt.orelse:
+                e_id = add_block("ElseBody", getattr(stmt.orelse[0], 'lineno', 0))
+                edges.append((cond_id, e_id))
+        if isinstance(stmt, (ast.For, ast.While)):
+            loop_entry = curr
+            if stmt.body:
+                body_id = add_block("LoopBody", getattr(stmt.body[0], 'lineno', 0))
+                edges.append((loop_entry, body_id))
+                edges.append((body_id, loop_entry))
+        if isinstance(stmt, (ast.Return, ast.Raise)):
+            end_id = add_block("Exit", getattr(stmt, 'lineno', 0))
+            edges.append((curr, end_id))
+
+    return {"blocks": blocks, "edges": edges}
+
+
+def _extract_python_data_flow(code: str) -> Dict[str, Any]:
+    tree = _safe_ast_parse(code)
+    data = {
+        "defs": {},
+        "uses": defaultdict(list),
+        "edges": [],
+        "return_flows": [],
+        "field_dependencies": defaultdict(list),
+        "taint": {"sources": [], "sinks": [], "sanitizers": [], "vulnerabilities": []}
+    }
+    if tree is None:
+        return {
+            "defs": {}, "uses": {}, "edges": [], "return_flows": [], "field_dependencies": {},
+            "taint": {"sources": [], "sinks": [], "sanitizers": [], "vulnerabilities": []}
+        }
+
+    tainted = set()
+
+    for n in ast.walk(tree):
+        if isinstance(n, ast.Assign):
+            rhs_names = {x.id for x in ast.walk(n.value) if isinstance(x, ast.Name)}
+            rhs_attrs = {f"{x.value.id}.{x.attr}" for x in ast.walk(n.value) if isinstance(x, ast.Attribute) and isinstance(x.value, ast.Name)}
+            call_name = _name_from_call(n.value) if isinstance(n.value, ast.Call) else ""
+
+            for t in n.targets:
+                if isinstance(t, ast.Name):
+                    var = t.id
+                    data["defs"][var] = getattr(n, 'lineno', 0)
+                    for src in rhs_names:
+                        data["edges"].append((src, var))
+                    for src in rhs_attrs:
+                        data["edges"].append((src, var))
+                    if any(src in tainted for src in rhs_names) or call_name in TAINT_SOURCES:
+                        tainted.add(var)
+                if isinstance(t, ast.Attribute) and isinstance(t.value, ast.Name):
+                    field = f"{t.value.id}.{t.attr}"
+                    data["defs"][field] = getattr(n, 'lineno', 0)
+                    for src in rhs_names:
+                        data["field_dependencies"][field].append(src)
+
+            if isinstance(n.value, ast.Call):
+                if call_name in TAINT_SOURCES:
+                    data["taint"]["sources"].append({"line": getattr(n, 'lineno', 0), "call": call_name})
+                if any(key in call_name for key in SANITIZERS):
+                    data["taint"]["sanitizers"].append({"line": getattr(n, 'lineno', 0), "call": call_name})
+
+        if isinstance(n, ast.Call):
+            cname = _name_from_call(n)
+            arg_names = {x.id for a in n.args for x in ast.walk(a) if isinstance(x, ast.Name)}
+            if cname in TAINT_SINKS:
+                data["taint"]["sinks"].append({"line": getattr(n, 'lineno', 0), "call": cname})
+                if any(a in tainted for a in arg_names):
+                    data["taint"]["vulnerabilities"].append({
+                        "line": getattr(n, 'lineno', 0),
+                        "sink": cname,
+                        "tainted_args": sorted([a for a in arg_names if a in tainted])
+                    })
+
+        if isinstance(n, ast.Return):
+            names = [x.id for x in ast.walk(n.value) if isinstance(x, ast.Name)] if n.value else []
+            data["return_flows"].append({"line": getattr(n, 'lineno', 0), "vars": names})
+
+        if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Load):
+            data["uses"][n.id].append(getattr(n, 'lineno', 0))
+
+        if isinstance(n, ast.Attribute) and isinstance(n.value, ast.Name):
+            key = f"{n.value.id}.{n.attr}"
+            data["uses"][key].append(getattr(n, 'lineno', 0))
+
+    return {
+        "defs": dict(data["defs"]),
+        "uses": {k: v for k, v in data["uses"].items()},
+        "edges": data["edges"],
+        "return_flows": data["return_flows"],
+        "field_dependencies": {k: v for k, v in data["field_dependencies"].items()},
+        "taint": data["taint"]
+    }
+
+
+def _symbolic_execution_preview(code: str) -> Dict[str, Any]:
+    """Lightweight symbolic execution preview with simple path constraints."""
+    tree = _safe_ast_parse(code)
+    if tree is None:
+        return {"constraints": [], "symbols": []}
+    constraints, symbols = [], set()
+    for n in ast.walk(tree):
+        if isinstance(n, ast.If):
+            cond = ast.unparse(n.test) if hasattr(ast, 'unparse') else 'condition'
+            constraints.append(cond)
+            for name in [x.id for x in ast.walk(n.test) if isinstance(x, ast.Name)]:
+                symbols.add(name)
+    return {"constraints": constraints[:40], "symbols": sorted(symbols)}
+
+
+def _generate_boundary_test_inputs(arg_names: List[str], arg_types: List[str]) -> List[Dict[str, Any]]:
+    """Generate basic boundary test payloads for runtime simulation."""
+    if not arg_names:
+        return []
+    samples = []
+    base = {}
+    for i, arg in enumerate(arg_names):
+        typ = (arg_types[i] if i < len(arg_types) else '').lower()
+        if 'int' in typ:
+            base[arg] = 0
+        elif 'float' in typ:
+            base[arg] = 0.0
+        elif 'bool' in typ:
+            base[arg] = False
+        else:
+            base[arg] = ""
+    samples.append(dict(base))
+    alt = {}
+    for i, arg in enumerate(arg_names):
+        typ = (arg_types[i] if i < len(arg_types) else '').lower()
+        if 'int' in typ:
+            alt[arg] = 1
+        elif 'float' in typ:
+            alt[arg] = 1.5
+        elif 'bool' in typ:
+            alt[arg] = True
+        else:
+            alt[arg] = "boundary"
+    samples.append(alt)
+    return samples
+
+
+def _extract_param_bindings(code: str) -> Dict[str, str]:
+    tree = _safe_ast_parse(code)
+    if tree is None:
+        return {}
+    for n in tree.body:
+        if isinstance(n, ast.FunctionDef):
+            return {a.arg: a.arg for a in n.args.args}
+    return {}
+
+
+def _infer_security_role(node_data: Dict[str, Any]) -> str:
+    code = (node_data.get('code') or '').lower()
+    decorators = [d.lower() for d in node_data.get('decorators', [])]
+    if any(tok in code for tok in ["request.", "input(", "sys.argv"]):
+        return "source"
+    if any(tok in code for tok in ["execute(", "eval(", "exec(", "os.system("]):
+        return "sink"
+    if any(tok in code for tok in ["sanitize", "escape", "validate"]):
+        return "sanitizer"
+    if any("auth" in d or "login_required" in d or "requires_auth" in d for d in decorators):
+        return "auth_boundary"
+    return "neutral"
+
+
+def _build_package_dependency_metadata(files_data: Dict[str, Dict[str, str]]) -> Dict[str, Any]:
+    out = {"package_json": {}, "requirements": {}, "all": {}}
+    if 'package.json' in files_data:
+        try:
+            pkg = json.loads(files_data['package.json']['content'])
+            out['package_json'] = {
+                **pkg.get('dependencies', {}),
+                **pkg.get('devDependencies', {})
+            }
+        except Exception:
+            pass
+    if 'requirements.txt' in files_data:
+        reqs = {}
+        for line in files_data['requirements.txt']['content'].splitlines():
+            line = line.strip()
+            if not line or line.startswith('#'):
+                continue
+            if '==' in line:
+                k, v = line.split('==', 1)
+                reqs[k.strip()] = v.strip()
+            else:
+                reqs[line] = '*'
+        out['requirements'] = reqs
+
+    merged = {}
+    merged.update(out['package_json'])
+    merged.update(out['requirements'])
+    out['all'] = merged
+    return out
+
+
+def _track_symbol_refactors(active_graph: Dict[str, Dict], previous_graph: Optional[Dict[str, Dict]]):
+    if not previous_graph:
+        return
+    prev_by_hash = defaultdict(list)
+    for old_id, old_node in previous_graph.items():
+        prev_by_hash[old_node.get('node_hash', '')].append((old_id, old_node))
+
+    for nid, node in active_graph.items():
+        nh = node.get('node_hash', '')
+        if not nh or nid in previous_graph:
+            continue
+        cands = prev_by_hash.get(nh, [])
+        if cands:
+            node['previous_identity'] = cands[0][0]
+
+
+def _load_reasoning_memory() -> List[Dict[str, Any]]:
+    if not os.path.exists(MEMORY_FILE):
+        return []
+    try:
+        with open(MEMORY_FILE, 'r') as f:
+            data = json.load(f)
+            return data if isinstance(data, list) else []
+    except Exception:
+        return []
+
+
+def _save_reasoning_memory(entries: List[Dict[str, Any]]):
+    os.makedirs(CACHE_DIR, exist_ok=True)
+    with open(MEMORY_FILE, 'w') as f:
+        json.dump(entries[-200:], f, indent=2)
+
+
+def _find_memory_match(query: str, threshold: float = 0.84) -> Optional[Dict[str, Any]]:
+    best, best_score = None, 0.0
+    for item in _load_reasoning_memory():
+        q = item.get('query', '')
+        score = SequenceMatcher(None, query.lower(), q.lower()).ratio()
+        if score > best_score:
+            best, best_score = item, score
+    if best and best_score >= threshold:
+        return best
+    return None
+
+
+def _record_reasoning_memory(query: str, selected_nodes: List[str], answer: str):
+    entries = _load_reasoning_memory()
+    entries.append({"query": query, "selected_nodes": selected_nodes[:80], "answer": answer[:3000], "ts": time.time()})
+    _save_reasoning_memory(entries)
+
+
+def export_graph_visualizations(multi_graph: Dict[str, Dict], output_dir: str = VISUALIZATION_DIR):
+    os.makedirs(output_dir, exist_ok=True)
+    for repo, graph in multi_graph.items():
+        symbol_dot = ["digraph SymbolGraph {"]
+        for nid, node in graph.items():
+            label = node.get('symbol', {}).get('name', nid.split('::')[-1]).replace('"', "'")
+            symbol_dot.append(f'  "{nid}" [label="{label}"];')
+            for dep in node.get('dependencies', []):
+                if dep in graph:
+                    symbol_dot.append(f'  "{nid}" -> "{dep}";')
+        symbol_dot.append("}")
+        with open(os.path.join(output_dir, f"{repo}_symbol.dot"), 'w') as f:
+            f.write("\n".join(symbol_dot))
+
+        for nid, node in list(graph.items())[:40]:
+            dfg = node.get('dfg', {})
+            cfg = node.get('cfg', {})
+            if dfg.get('edges'):
+                dfg_dot = ["digraph DFG {"]
+                for src, dst in dfg.get('edges', [])[:200]:
+                    dfg_dot.append(f'  "{src}" -> "{dst}";')
+                dfg_dot.append("}")
+                with open(os.path.join(output_dir, f"{repo}_{hashlib.md5(nid.encode()).hexdigest()[:10]}_dfg.dot"), 'w') as f:
+                    f.write("\n".join(dfg_dot))
+            if cfg.get('edges'):
+                cfg_dot = ["digraph CFG {"]
+                for b in cfg.get('blocks', []):
+                    cfg_dot.append(f'  "{b.get("id")}" [label="{b.get("kind")}@{b.get("lineno")}"];')
+                for src, dst in cfg.get('edges', [])[:200]:
+                    cfg_dot.append(f'  "{src}" -> "{dst}";')
+                cfg_dot.append("}")
+                with open(os.path.join(output_dir, f"{repo}_{hashlib.md5(nid.encode()).hexdigest()[:10]}_cfg.dot"), 'w') as f:
+                    f.write("\n".join(cfg_dot))
 
 def _extract_external_lib_from_import(import_stmt: str) -> Optional[str]:
     """Extract external library/module root from common import syntaxes."""
@@ -1954,6 +2345,7 @@ class VectorEmbeddingStore:
         self.node_ids = []
         self.node_metadata = {}
         self.last_scores = {}
+        self.embedding_cache = {"intent": {}, "code": {}, "structure": {}}
 
         # Sparse retrieval state (BM25-like)
         self.doc_term_freqs = []
@@ -1962,9 +2354,45 @@ class VectorEmbeddingStore:
         self.avg_doc_len = 1.0
 
         if HAS_FAISS:
-            self.intent_index = faiss.IndexFlatIP(dimension)
-            self.code_index = faiss.IndexFlatIP(dimension)
-            self.structure_index = faiss.IndexFlatIP(dimension)
+            self._reset_indices()
+
+    def _reset_indices(self):
+        if HAS_FAISS:
+            self.intent_index = faiss.IndexFlatIP(self.dimension)
+            self.code_index = faiss.IndexFlatIP(self.dimension)
+            self.structure_index = faiss.IndexFlatIP(self.dimension)
+
+    def _compose_node_texts(self, node_id: str, data: Dict[str, Any]) -> Tuple[str, str, str]:
+        code_preview = data.get('code', '')[:1200]
+        symbol_name = data.get('symbol', {}).get('name', node_id.split('::')[-1])
+
+        intent_text = f"""
+Function: {symbol_name}
+File: {data.get('file', '')}
+Route: {data.get('api_route') or ''}
+Docstring:
+{data.get('docstring', '')}
+Developer Comments:
+{data.get('comments_above', '')}
+"""
+        code_text = f"""
+Function: {symbol_name}
+File: {data.get('file', '')}
+Type: {data.get('type', 'function')}
+Code:
+{code_preview}
+"""
+        structure_text = f"""
+Function: {symbol_name}
+Type: {data.get('type', 'function')}
+Args: {', '.join(data.get('arg_names', []))}
+Arg Types: {', '.join(data.get('arg_types', []))}
+Return Type: {data.get('return_type') or ''}
+Decorators: {', '.join(data.get('decorators', []))}
+Exceptions: {', '.join(data.get('exception_types', []))}
+Inherits: {', '.join(data.get('bases', []))}
+"""
+        return intent_text, code_text, structure_text
 
     def _build_sparse_index(self, texts: List[str]):
         self.doc_term_freqs = []
@@ -2007,82 +2435,99 @@ class VectorEmbeddingStore:
                 denom = tf + k1 * (1 - b + b * (dl / max(self.avg_doc_len, 1e-6)))
                 scores[self.node_ids[idx]] += idf * (tf * (k1 + 1)) / max(denom, 1e-6)
 
-        if not scores:
-            return {}
-        max_score = max(scores.values()) or 1.0
-        return {nid: s / max_score for nid, s in scores.items()}
+        return dict(scores)
 
     async def build_index(self, graph: Dict[str, Dict]):
         """Build intent/code/structure FAISS indices and sparse lexical stats."""
+        await self.update_index(graph)
+
+    async def update_index(
+        self,
+        graph: Dict[str, Dict],
+        old_graph_ids: Optional[Set[str]] = None,
+        previous_store: Optional['VectorEmbeddingStore'] = None
+    ):
+        """Incrementally refresh index by re-embedding only new/changed nodes, while rebuilding FAISS structure."""
         if not HAS_FAISS or not graph:
             return
 
+        old_graph_ids = old_graph_ids or set()
+        prev_intent = {}
+        prev_code = {}
+        prev_structure = {}
+        if previous_store:
+            prev_intent = dict(previous_store.embedding_cache.get('intent', {}))
+            prev_code = dict(previous_store.embedding_cache.get('code', {}))
+            prev_structure = dict(previous_store.embedding_cache.get('structure', {}))
+
+        node_ids = list(graph.keys())
         intent_texts, code_texts, structure_texts = [], [], []
-        node_ids = []
+        ids_to_embed = []
 
-        for node_id, data in graph.items():
-            code_preview = data.get('code', '')[:1200]
-            symbol_name = data.get('symbol', {}).get('name', node_id.split('::')[-1])
-
-            intent_text = f"""
-Function: {symbol_name}
-File: {data.get('file', '')}
-Route: {data.get('api_route') or ''}
-Docstring:
-{data.get('docstring', '')}
-Developer Comments:
-{data.get('comments_above', '')}
-"""
-            code_text = f"""
-Function: {symbol_name}
-File: {data.get('file', '')}
-Type: {data.get('type', 'function')}
-Code:
-{code_preview}
-"""
-            structure_text = f"""
-Function: {symbol_name}
-Type: {data.get('type', 'function')}
-Args: {', '.join(data.get('arg_names', []))}
-Arg Types: {', '.join(data.get('arg_types', []))}
-Return Type: {data.get('return_type') or ''}
-Decorators: {', '.join(data.get('decorators', []))}
-Exceptions: {', '.join(data.get('exception_types', []))}
-Inherits: {', '.join(data.get('bases', []))}
-"""
-
+        for node_id in node_ids:
+            data = graph[node_id]
+            self.node_metadata[node_id] = data
+            intent_text, code_text, structure_text = self._compose_node_texts(node_id, data)
             intent_texts.append(intent_text)
             code_texts.append(code_text)
             structure_texts.append(structure_text)
-            node_ids.append(node_id)
-            self.node_metadata[node_id] = data
 
-        if not intent_texts:
-            return
+            if (
+                node_id in old_graph_ids
+                and node_id in prev_intent
+                and node_id in prev_code
+                and node_id in prev_structure
+            ):
+                continue
+            ids_to_embed.append(node_id)
 
-        self._build_sparse_index([f"{intent_texts[i]}\n{code_texts[i]}\n{structure_texts[i]}" for i in range(len(intent_texts))])
+        self.embedding_cache = {"intent": {}, "code": {}, "structure": {}}
+        for node_id in node_ids:
+            if node_id in prev_intent and node_id in prev_code and node_id in prev_structure and node_id in old_graph_ids:
+                self.embedding_cache['intent'][node_id] = prev_intent[node_id]
+                self.embedding_cache['code'][node_id] = prev_code[node_id]
+                self.embedding_cache['structure'][node_id] = prev_structure[node_id]
 
-        intent_embeddings, code_embeddings, structure_embeddings = [], [], []
-        for i in range(0, len(intent_texts), EMBEDDING_BATCH_SIZE):
-            i_batch = intent_texts[i:i + EMBEDDING_BATCH_SIZE]
-            c_batch = code_texts[i:i + EMBEDDING_BATCH_SIZE]
-            s_batch = structure_texts[i:i + EMBEDDING_BATCH_SIZE]
-            intent_embeddings.extend(await get_embeddings_batch(i_batch))
-            code_embeddings.extend(await get_embeddings_batch(c_batch))
-            structure_embeddings.extend(await get_embeddings_batch(s_batch))
-            print(f"      Embedded {min(i + EMBEDDING_BATCH_SIZE, len(intent_texts))}/{len(intent_texts)} nodes", flush=True)
+        if ids_to_embed:
+            for i in range(0, len(ids_to_embed), EMBEDDING_BATCH_SIZE):
+                id_batch = ids_to_embed[i:i + EMBEDDING_BATCH_SIZE]
+                i_batch, c_batch, s_batch = [], [], []
+                for nid in id_batch:
+                    data = graph[nid]
+                    intent_text, code_text, structure_text = self._compose_node_texts(nid, data)
+                    i_batch.append(intent_text)
+                    c_batch.append(code_text)
+                    s_batch.append(structure_text)
 
-        if intent_embeddings and code_embeddings and structure_embeddings:
-            intent_arr = np.array(intent_embeddings, dtype=np.float32)
-            code_arr = np.array(code_embeddings, dtype=np.float32)
-            structure_arr = np.array(structure_embeddings, dtype=np.float32)
+                intent_embeddings = await get_embeddings_batch(i_batch)
+                code_embeddings = await get_embeddings_batch(c_batch)
+                structure_embeddings = await get_embeddings_batch(s_batch)
+
+                for idx, nid in enumerate(id_batch):
+                    self.embedding_cache['intent'][nid] = intent_embeddings[idx]
+                    self.embedding_cache['code'][nid] = code_embeddings[idx]
+                    self.embedding_cache['structure'][nid] = structure_embeddings[idx]
+
+                print(f"      Embedded {min(i + EMBEDDING_BATCH_SIZE, len(ids_to_embed))}/{len(ids_to_embed)} changed nodes", flush=True)
+
+        self._build_sparse_index([f"{intent_texts[i]}\n{code_texts[i]}\n{structure_texts[i]}" for i in range(len(node_ids))])
+
+        self._reset_indices()
+        ordered_intent = [self.embedding_cache['intent'][nid] for nid in node_ids if nid in self.embedding_cache['intent']]
+        ordered_code = [self.embedding_cache['code'][nid] for nid in node_ids if nid in self.embedding_cache['code']]
+        ordered_structure = [self.embedding_cache['structure'][nid] for nid in node_ids if nid in self.embedding_cache['structure']]
+
+        if ordered_intent and ordered_code and ordered_structure:
+            intent_arr = np.array(ordered_intent, dtype=np.float32)
+            code_arr = np.array(ordered_code, dtype=np.float32)
+            structure_arr = np.array(ordered_structure, dtype=np.float32)
             faiss.normalize_L2(intent_arr)
             faiss.normalize_L2(code_arr)
             faiss.normalize_L2(structure_arr)
             self.intent_index.add(intent_arr)
             self.code_index.add(code_arr)
             self.structure_index.add(structure_arr)
-            self.node_ids = node_ids
+            self.node_ids = [nid for nid in node_ids if nid in self.embedding_cache['intent']]
 
     async def search(self, query: str, k: int = TOP_K_SEEDS) -> List[str]:
         """Hybrid search: embedding + BM25 + centrality."""
@@ -2116,7 +2561,8 @@ Inherits: {', '.join(data.get('bases', []))}
             if idx < len(self.node_ids):
                 struct_scores[self.node_ids[idx]] = float(s_dist[0][rank])
 
-        bm25_scores = self._bm25_scores(query)
+        bm25_raw = self._bm25_scores(query)
+        bm25_scores = _normalize_scores(bm25_raw)
         candidate_ids = set(intent_scores) | set(code_scores) | set(struct_scores) | set(bm25_scores)
 
         candidates = []
@@ -2145,6 +2591,7 @@ Inherits: {', '.join(data.get('bases', []))}
             candidates.append((final_score, node_id))
 
         candidates.sort(reverse=True, key=lambda item: item[0])
+        candidates = _apply_graph_distance_reranking(candidates[: max(k * 10, 20)], self.node_metadata)
         self.last_scores = {node_id: score for score, node_id in candidates}
         return [node_id for score, node_id in candidates[:k]]
 
@@ -2163,7 +2610,8 @@ Inherits: {', '.join(data.get('bases', []))}
                     'doc_term_freqs': self.doc_term_freqs,
                     'doc_lengths': self.doc_lengths,
                     'df': dict(self.df),
-                    'avg_doc_len': self.avg_doc_len
+                    'avg_doc_len': self.avg_doc_len,
+                    'embedding_cache': self.embedding_cache
                 }, f)
         else:
             raise RuntimeError("Cannot save index: FAISS unavailable or index is empty.")
@@ -2182,16 +2630,50 @@ Inherits: {', '.join(data.get('bases', []))}
                 self.doc_lengths = data.get('doc_lengths', [])
                 self.df = defaultdict(int, data.get('df', {}))
                 self.avg_doc_len = data.get('avg_doc_len', 1.0)
+                self.embedding_cache = data.get('embedding_cache', {"intent": {}, "code": {}, "structure": {}})
+
 
 # --- Graph Building ---
 
-async def build_single_repo_graph(repo_name: str, files_data: Dict[str, Dict]) -> Tuple[Dict, 'ImportResolver']:
-    """Build graph with Tree-sitter parsing and import resolution."""
+async def build_single_repo_graph(
+    repo_name: str,
+    files_data: Dict[str, Dict],
+    previous_graph: Optional[Dict[str, Dict]] = None,
+    changed_files: Optional[Set[str]] = None
+) -> Tuple[Dict, 'ImportResolver']:
+    """Build graph with incremental Tree-sitter parsing and import resolution."""
     parser = TreeSitterParser()
-    
-    parsed_data = {}
 
-    print(f"   🔍 Parsing {len(files_data)} files in [{repo_name}]...")
+    if changed_files is None:
+        changed_files = set(files_data.keys())
+    else:
+        changed_files = set(changed_files)
+
+    removed_files = set()
+    if previous_graph:
+        removed_files = {n.get('file') for n in previous_graph.values() if n.get('file') and n.get('file') not in files_data}
+
+    files_to_reparse = {fname for fname in changed_files if fname in files_data}
+    files_to_purge = files_to_reparse | removed_files
+
+    graph = {}
+    if previous_graph:
+        for node_id, node in previous_graph.items():
+            node_file = node.get('file')
+            node_type = node.get('type')
+            if node_type == 'folder':
+                continue
+            if node_file in files_to_purge:
+                continue
+            copied = dict(node)
+            copied['dependencies'] = list(node.get('dependencies', []))
+            copied['inherits'] = list(node.get('inherits', []))
+            copied['callers'] = []
+            copied['cross_repo_deps'] = list(node.get('cross_repo_deps', []))
+            graph[node_id] = copied
+
+    parsed_data = {}
+    print(f"   🔍 Parsing {len(files_to_reparse)} changed files in [{repo_name}]...")
     parse_semaphore = asyncio.Semaphore(16)
 
     async def _parse_one(filename: str, data: Dict[str, str]):
@@ -2199,19 +2681,40 @@ async def build_single_repo_graph(repo_name: str, files_data: Dict[str, Dict]) -
             result = await asyncio.to_thread(parser.parse, filename, data['content'])
             return filename, result
 
-    parse_results = await asyncio.gather(*[_parse_one(filename, data) for filename, data in files_data.items()])
+    parse_results = await asyncio.gather(*[_parse_one(filename, files_data[filename]) for filename in files_to_reparse]) if files_to_reparse else []
     for filename, result in parse_results:
         parsed_data[filename] = result
-    
+
     resolver = ImportResolver(files_data)
     resolver.build_maps(parsed_data)
-    
+
     symbol_registry = defaultdict(list)
+    for node_id, ndata in graph.items():
+        symbol_name = ndata.get('symbol', {}).get('name', node_id.split('::')[-1])
+        symbol_registry[symbol_name].append({
+            "file": ndata.get('file', ''),
+            "symbol": symbol_name,
+            "type": ndata.get('type', 'function'),
+            "code": ndata.get('code', ''),
+            "calls": [],
+            "api_route": ndata.get('api_route'),
+            "api_outbound": ndata.get('api_outbound', []),
+            "docstring": ndata.get('docstring', ''),
+            "comments_above": ndata.get('comments_above', ''),
+            "comment_ratio": ndata.get('comment_ratio', 0.0),
+            "comment_quality": ndata.get('comment_quality', 0.0),
+            "arg_names": ndata.get('arg_names', []),
+            "arg_types": ndata.get('arg_types', []),
+            "return_type": ndata.get('return_type'),
+            "variable_mentions": ndata.get('variable_mentions', []),
+            "exception_types": ndata.get('exception_types', []),
+            "decorators": ndata.get('decorators', []),
+            "bases": ndata.get('bases', [])
+        })
+
     file_globals = {}
-    
     for filename, result in parsed_data.items():
         file_globals[filename] = result['globals']
-        
         for node in result['nodes']:
             name = node['name']
             symbol_registry[name].append({
@@ -2234,19 +2737,17 @@ async def build_single_repo_graph(repo_name: str, files_data: Dict[str, Dict]) -
                 "decorators": node.get('decorators', []),
                 "bases": node.get('bases', [])
             })
-    
-    graph = {}
+
     defined_symbols = set(symbol_registry.keys())
-    
-    for sym_name, implementations in symbol_registry.items():
-        for impl in implementations:
-            node_id = f"{impl['file']}::{sym_name}"
-            
+
+    for filename, result in parsed_data.items():
+        for node in result['nodes']:
+            sym_name = node['name']
+            node_id = f"{filename}::{sym_name}"
             valid_deps = []
-            
-            for called_func in impl['calls']:
-                source_file = resolver.resolve_call(impl['file'], called_func)
-                
+
+            for called_func in node.get('calls', []):
+                source_file = resolver.resolve_call(filename, called_func)
                 if source_file:
                     candidates = symbol_registry.get(called_func, [])
                     for candidate in candidates:
@@ -2255,57 +2756,64 @@ async def build_single_repo_graph(repo_name: str, files_data: Dict[str, Dict]) -
                             if target_id != node_id:
                                 valid_deps.append(target_id)
                             break
-                else:
-                    if called_func in defined_symbols:
-                        targets = symbol_registry[called_func]
-                        for target in targets:
-                            target_id = f"{target['file']}::{called_func}"
-                            if target_id != node_id:
-                                valid_deps.append(target_id)
-            
+                elif called_func in defined_symbols:
+                    for target in symbol_registry[called_func]:
+                        target_id = f"{target['file']}::{called_func}"
+                        if target_id != node_id:
+                            valid_deps.append(target_id)
+
+            node_dfg = _extract_python_data_flow(node['code']) if filename.endswith('.py') else {"defs": {}, "uses": {}, "edges": [], "return_flows": [], "field_dependencies": {}, "taint": {"sources": [], "sinks": [], "sanitizers": [], "vulnerabilities": []}}
+            node_cfg = _extract_python_cfg(node['code']) if filename.endswith('.py') else {"blocks": [], "edges": []}
+            node_types = _extract_type_awareness(node['code']) if filename.endswith('.py') else {"type_registry": {}, "interface_links": [], "generic_usages": [], "field_links": {}}
+
             graph[node_id] = {
                 "repo": repo_name,
-                "symbol": {"repo": repo_name, "file": impl['file'], "name": impl.get('symbol', sym_name)},
-                "file": impl['file'],
-                "code": impl['code'],
-                "type": impl['type'],
-                "globals": file_globals.get(impl['file'], ""),
+                "symbol": {"repo": repo_name, "file": filename, "name": sym_name},
+                "file": filename,
+                "code": node['code'],
+                "type": node['type'],
+                "globals": file_globals.get(filename, ""),
                 "dependencies": list(set(valid_deps)),
                 "inherits": [],
                 "callers": [],
-                "api_route": impl.get('api_route'),
-                "api_outbound": impl.get('api_outbound', []),
-                "docstring": impl.get('docstring', ''),
-                "comments_above": impl.get('comments_above', ''),
-                "comment_ratio": impl.get('comment_ratio', 0.0),
-                "comment_quality": impl.get('comment_quality', 0.0),
-                "arg_names": impl.get('arg_names', []),
-                "arg_types": impl.get('arg_types', []),
-                "return_type": impl.get('return_type'),
-                "variable_mentions": impl.get('variable_mentions', []),
-                "exception_types": impl.get('exception_types', []),
-                "decorators": impl.get('decorators', []),
-                "bases": impl.get('bases', []),
-                "global_id": _global_node_id(repo_name, impl['file'], impl.get('symbol', sym_name)),
+                "api_route": node.get('api_route'),
+                "api_outbound": node.get('api_outbound', []),
+                "docstring": node.get('docstring', ''),
+                "comments_above": node.get('comments_above', ''),
+                "comment_ratio": node.get('comment_ratio', 0.0),
+                "comment_quality": node.get('comment_quality', 0.0),
+                "arg_names": node.get('arg_names', []),
+                "arg_types": node.get('arg_types', []),
+                "return_type": node.get('return_type'),
+                "variable_mentions": node.get('variable_mentions', []),
+                "exception_types": node.get('exception_types', []),
+                "decorators": node.get('decorators', []),
+                "bases": node.get('bases', []),
+                "global_id": _global_node_id(repo_name, filename, sym_name),
                 "node_hash": "",
+                "pagerank": 0.0,
                 "centrality_score": 0.0,
-                "cross_repo_deps": []
+                "cross_repo_deps": [],
+                "dfg": node_dfg,
+                "cfg": node_cfg,
+                "type_info": node_types,
+                "param_bindings": _extract_param_bindings(node['code']) if filename.endswith('.py') else {},
+                "symbolic_execution": _symbolic_execution_preview(node['code']) if filename.endswith('.py') else {"constraints": [], "symbols": []},
+                "test_inputs": _generate_boundary_test_inputs(node.get('arg_names', []), node.get('arg_types', [])),
+                "security_role": "",
+                "requires_auth": any('auth' in (d or '').lower() or 'login_required' in (d or '').lower() for d in node.get('decorators', [])),
+                "previous_identity": None
             }
-    
-    # NEW: Ensure ALL files from files_data are represented in the graph
-    # even if they have no functions/classes (e.g. config files, constants)
-    for filename, data in files_data.items():
-        # Check if this file has ANY nodes in the graph
-        file_has_nodes = any(node['file'] == filename for node in graph.values())
-        
+
+    for filename in files_to_reparse:
+        file_has_nodes = any(node.get('file') == filename for node in graph.values())
         if not file_has_nodes:
-            # Add a placeholder 'module' node so the file is seen by the summarizer and overview
             node_id = f"{filename}::module"
             graph[node_id] = {
                 "repo": repo_name,
                 "symbol": {"repo": repo_name, "file": filename, "name": "module"},
                 "file": filename,
-                "code": data['content'][:2000], # Include some preview
+                "code": files_data[filename]['content'][:2000],
                 "type": "module",
                 "globals": file_globals.get(filename, ""),
                 "dependencies": [],
@@ -2326,11 +2834,59 @@ async def build_single_repo_graph(repo_name: str, files_data: Dict[str, Dict]) -
                 "bases": [],
                 "global_id": _global_node_id(repo_name, filename, "module"),
                 "node_hash": "",
+                "pagerank": 0.0,
                 "centrality_score": 0.0,
-                "cross_repo_deps": []
+                "cross_repo_deps": [],
+                "dfg": {"defs": {}, "uses": {}, "edges": [], "return_flows": [], "field_dependencies": {}, "taint": {"sources": [], "sinks": [], "sanitizers": [], "vulnerabilities": []}},
+                "cfg": {"blocks": [], "edges": []},
+                "type_info": {"type_registry": {}, "interface_links": [], "generic_usages": [], "field_links": {}},
+                "param_bindings": {},
+                "security_role": "neutral",
+                "requires_auth": False,
+                "previous_identity": None
             }
-    
-    # Build hierarchical folder nodes (folder -> contains file/module/function nodes)
+
+    for filename in files_data.keys():
+        file_has_nodes = any(node.get('file') == filename for node in graph.values())
+        if not file_has_nodes:
+            node_id = f"{filename}::module"
+            graph[node_id] = {
+                "repo": repo_name,
+                "symbol": {"repo": repo_name, "file": filename, "name": "module"},
+                "file": filename,
+                "code": files_data[filename]['content'][:2000],
+                "type": "module",
+                "globals": "",
+                "dependencies": [],
+                "inherits": [],
+                "callers": [],
+                "api_route": None,
+                "api_outbound": [],
+                "docstring": "",
+                "comments_above": "",
+                "comment_ratio": 0.0,
+                "comment_quality": 0.0,
+                "arg_names": [],
+                "arg_types": [],
+                "return_type": None,
+                "variable_mentions": [],
+                "exception_types": [],
+                "decorators": [],
+                "bases": [],
+                "global_id": _global_node_id(repo_name, filename, "module"),
+                "node_hash": "",
+                "pagerank": 0.0,
+                "centrality_score": 0.0,
+                "cross_repo_deps": [],
+                "dfg": {"defs": {}, "uses": {}, "edges": [], "return_flows": [], "field_dependencies": {}, "taint": {"sources": [], "sinks": [], "sanitizers": [], "vulnerabilities": []}},
+                "cfg": {"blocks": [], "edges": []},
+                "type_info": {"type_registry": {}, "interface_links": [], "generic_usages": [], "field_links": {}},
+                "param_bindings": {},
+                "security_role": "neutral",
+                "requires_auth": False,
+                "previous_identity": None
+            }
+
     folder_children = defaultdict(set)
     file_root_nodes = defaultdict(list)
     for nid, ndata in graph.items():
@@ -2382,11 +2938,20 @@ async def build_single_repo_graph(repo_name: str, files_data: Dict[str, Dict]) -
             "bases": [],
             "global_id": _global_node_id(repo_name, folder_path, folder_key),
             "node_hash": "",
+            "pagerank": 0.0,
             "centrality_score": 0.0,
-            "cross_repo_deps": []
+            "cross_repo_deps": [],
+            "dfg": {"defs": {}, "uses": {}, "edges": [], "return_flows": [], "field_dependencies": {}, "taint": {"sources": [], "sinks": [], "sanitizers": [], "vulnerabilities": []}},
+            "cfg": {"blocks": [], "edges": []},
+            "type_info": {"type_registry": {}, "interface_links": [], "generic_usages": [], "field_links": {}},
+            "param_bindings": {},
+            "symbolic_execution": {"constraints": [], "symbols": []},
+            "test_inputs": [],
+            "security_role": "neutral",
+            "requires_auth": False,
+            "previous_identity": None
         }
 
-    # Add inheritance/interface edges for class nodes.
     class_name_to_ids = defaultdict(list)
     for nid, ndata in graph.items():
         if ndata.get('type') == 'class':
@@ -2404,7 +2969,6 @@ async def build_single_repo_graph(repo_name: str, files_data: Dict[str, Dict]) -
                 if base_id != nid and base_id not in ndata['dependencies']:
                     ndata['dependencies'].append(base_id)
 
-    # Add external library shadow nodes for unresolved imports.
     external_nodes = {}
     for filename, result in parsed_data.items():
         unresolved_libs = set()
@@ -2418,10 +2982,10 @@ async def build_single_repo_graph(repo_name: str, files_data: Dict[str, Dict]) -
                 continue
             unresolved_libs.add(lib)
 
-        if not unresolved_libs:
-            continue
-
         file_nodes = [gid for gid, gdata in graph.items() if gdata.get('file') == filename]
+        for fnid in file_nodes:
+            graph[fnid]['dependencies'] = [d for d in graph[fnid].get('dependencies', []) if not str(d).startswith('EXT::')]
+
         for lib in unresolved_libs:
             ext_id = f"EXT::{lib}"
             if ext_id not in graph and ext_id not in external_nodes:
@@ -2446,6 +3010,7 @@ async def build_single_repo_graph(repo_name: str, files_data: Dict[str, Dict]) -
                     "bases": [],
                     "global_id": _global_node_id(repo_name, "<external>", lib),
                     "node_hash": "",
+                    "pagerank": 0.0,
                     "centrality_score": 0.0,
                     "cross_repo_deps": []
                 }
@@ -2455,17 +3020,93 @@ async def build_single_repo_graph(repo_name: str, files_data: Dict[str, Dict]) -
 
     graph.update(external_nodes)
 
-    # Populate reverse dependency edges (callers)
+    for nid, ndata in graph.items():
+        ndata['dependencies'] = [dep for dep in ndata.get('dependencies', []) if dep in graph]
+        ndata['callers'] = []
+
     for source_id, source_data in graph.items():
         for target_id in source_data.get('dependencies', []):
             if target_id in graph and source_id not in graph[target_id]['callers']:
                 graph[target_id]['callers'].append(source_id)
 
-    # Compute centrality + node content hash.
+    # Inter-procedural variable flow: map caller argument names -> callee params.
+    for source_id, source_data in graph.items():
+        for dep_id in source_data.get('dependencies', []):
+            dep_node = graph.get(dep_id)
+            if not dep_node:
+                continue
+            callee_params = dep_node.get('arg_names', [])
+            caller_vars = []
+            for v in source_data.get('dfg', {}).get('uses', {}).keys():
+                if isinstance(v, str) and re.match(r'^[a-zA-Z_][a-zA-Z0-9_]*$', v):
+                    caller_vars.append(v)
+            bindings = {}
+            for idx, param in enumerate(callee_params):
+                if idx < len(caller_vars):
+                    bindings[param] = caller_vars[idx]
+            if bindings:
+                dep_node.setdefault('param_bindings', {}).update(bindings)
+
+    # Type/security enrichments and defaults
     for nid, ndata in graph.items():
-        degree = len(ndata.get('callers', [])) + len(ndata.get('dependencies', []))
-        ndata['centrality_score'] = min(degree / 25.0, 1.0)
+        ndata.setdefault('dfg', {"defs": {}, "uses": {}, "edges": [], "return_flows": [], "field_dependencies": {}, "taint": {"sources": [], "sinks": [], "sanitizers": [], "vulnerabilities": []}})
+        ndata.setdefault('cfg', {"blocks": [], "edges": []})
+        ndata.setdefault('type_info', {"type_registry": {}, "interface_links": [], "generic_usages": [], "field_links": {}})
+        ndata.setdefault('param_bindings', {})
+        ndata.setdefault('previous_identity', None)
+        ndata.setdefault('symbolic_execution', {"constraints": [], "symbols": []})
+        ndata.setdefault('test_inputs', _generate_boundary_test_inputs(ndata.get('arg_names', []), ndata.get('arg_types', [])))
+        ndata['security_role'] = _infer_security_role(ndata)
+        if ndata.get('security_role') == 'auth_boundary':
+            ndata['requires_auth'] = True
+
+    # Add package-level dependency graph node.
+    pkg_meta = _build_package_dependency_metadata(files_data)
+    pkg_node_id = "package::dependencies"
+    graph[pkg_node_id] = {
+        "repo": repo_name,
+        "symbol": {"repo": repo_name, "file": "package-manifest", "name": "package_dependencies"},
+        "file": "package-manifest",
+        "code": json.dumps(pkg_meta, ensure_ascii=False)[:4000],
+        "type": "package_dependencies",
+        "globals": "",
+        "dependencies": [],
+        "inherits": [],
+        "callers": [],
+        "api_route": None,
+        "api_outbound": [],
+        "docstring": "Dependency manifest extracted from package.json / requirements.txt",
+        "comments_above": "",
+        "comment_ratio": 0.0,
+        "comment_quality": 0.0,
+        "arg_names": [],
+        "arg_types": [],
+        "return_type": None,
+        "variable_mentions": [],
+        "exception_types": [],
+        "decorators": [],
+        "bases": [],
+        "global_id": _global_node_id(repo_name, "package-manifest", "package_dependencies"),
+        "node_hash": "",
+        "pagerank": 0.0,
+        "centrality_score": 0.0,
+        "cross_repo_deps": [],
+        "dfg": {"defs": {}, "uses": {}, "edges": [], "return_flows": [], "field_dependencies": {}, "taint": {"sources": [], "sinks": [], "sanitizers": [], "vulnerabilities": []}},
+        "cfg": {"blocks": [], "edges": []},
+        "type_info": {"type_registry": {}, "interface_links": [], "generic_usages": [], "field_links": {}},
+        "param_bindings": {},
+        "security_role": "neutral",
+        "requires_auth": False,
+        "previous_identity": None,
+        "package_dependencies": pkg_meta
+    }
+
+    _compute_graph_centrality(graph)
+
+    for nid, ndata in graph.items():
         ndata['node_hash'] = _compute_node_content_hash(ndata)
+
+    _track_symbol_refactors(graph, previous_graph)
 
     print(f"   ✅ Built graph for [{repo_name}]: {len(graph)} nodes")
     return graph, resolver
@@ -2512,6 +3153,23 @@ def link_cross_repo_dependencies(multi_graph: Dict[str, Dict]) -> Dict[str, Dict
     
     return multi_graph
 
+def _detect_dependency_version_conflicts(multi_graph: Dict[str, Dict]) -> List[Dict[str, Any]]:
+    seen = defaultdict(list)
+    for repo, graph in multi_graph.items():
+        pkg_node = graph.get('package::dependencies')
+        if not pkg_node:
+            continue
+        for dep, ver in (pkg_node.get('package_dependencies', {}).get('all', {}) or {}).items():
+            seen[dep].append((repo, str(ver)))
+
+    conflicts = []
+    for dep, vals in seen.items():
+        versions = sorted(set(v for _, v in vals))
+        if len(versions) > 1:
+            conflicts.append({"dependency": dep, "versions": versions, "repos": vals})
+    return conflicts
+
+
 async def build_multi_symbol_graph(
     multi_repo_data: Dict[str, Dict],
     summarizer: ProjectSummarizer,
@@ -2522,21 +3180,27 @@ async def build_multi_symbol_graph(
 ) -> Tuple[Dict, Dict]:
     """Build graphs for all repos with embeddings and summaries."""
     print("\n🕵️ Building symbol graphs with enhanced parsing...")
-    
+
     multi_graph = {}
     resolvers = {}
-    
-    for repo_name, files_data in multi_repo_data.items():
-        graph, resolver = await build_single_repo_graph(repo_name, files_data)
 
+    for repo_name, files_data in multi_repo_data.items():
         prev_repo_hashes = (previous_file_hashes or {}).get(repo_name, {})
         curr_repo_hashes = (current_file_hashes or {}).get(repo_name, {})
         changed_files = {
             fname for fname, fhash in curr_repo_hashes.items()
             if prev_repo_hashes.get(fname) != fhash
         }
+        deleted_files = {fname for fname in prev_repo_hashes.keys() if fname not in curr_repo_hashes}
+        changed_files.update(deleted_files)
 
-        # Project Summarization: summarize files concurrently with cap to avoid cost spikes.
+        graph, resolver = await build_single_repo_graph(
+            repo_name,
+            files_data,
+            previous_graph=(previous_graph or {}).get(repo_name, {}),
+            changed_files=changed_files if previous_graph else None
+        )
+
         print(f"   📝 Summarizing {len(files_data)} files in [{repo_name}]...")
         if changed_files:
             print(f"      ♻️ Partial re-index: {len(changed_files)} changed file(s) in [{repo_name}]")
@@ -2544,7 +3208,6 @@ async def build_multi_symbol_graph(
 
         async def _summarize_one(fname: str, data: Dict[str, str]):
             async with semaphore:
-                # Skip unchanged files when previous summary exists.
                 if changed_files and fname not in changed_files and fname in summarizer.file_summaries:
                     return
                 symbol_names = [{"name": k.split("::")[-1]} for k in graph.keys() if graph[k]['file'] == fname]
@@ -2555,17 +3218,20 @@ async def build_multi_symbol_graph(
 
         multi_graph[repo_name] = graph
         resolvers[repo_name] = resolver
-    
+
     multi_graph = link_cross_repo_dependencies(multi_graph)
-    
-    # Generate project level overview
+    dep_conflicts = _detect_dependency_version_conflicts(multi_graph)
+    if dep_conflicts:
+        print(f"⚠️ Dependency version conflicts detected: {len(dep_conflicts)}")
+        for c in dep_conflicts[:20]:
+            print(f"   - {c['dependency']}: {', '.join(c['versions'])}")
+            for repo, ver in c.get('repos', []):
+                print(f"      · {repo}: {ver}")
     await summarizer.generate_project_overview(multi_graph)
-    
+
     vector_stores = {}
-    
-    # Only build embeddings if we have nodes
     has_nodes = any(len(graph) > 0 for graph in multi_graph.values())
-    
+
     if has_nodes and HAS_FAISS:
         print("   🧬 Building vector embeddings...")
         combined_graph = {}
@@ -2575,26 +3241,23 @@ async def build_multi_symbol_graph(
             if not graph:
                 continue
 
-            # Reuse prior index when node hashes are unchanged.
-            can_reuse = False
             prev_repo_graph = (previous_graph or {}).get(repo_name, {})
             prev_store = previous_vector_stores.get(repo_name)
+            old_graph_ids = set()
             if prev_repo_graph and prev_store:
-                new_hashes = sorted([n.get('node_hash', '') for n in graph.values()])
-                old_hashes = sorted([n.get('node_hash', '') for n in prev_repo_graph.values()])
-                can_reuse = new_hashes == old_hashes
+                for old_id, old_node in prev_repo_graph.items():
+                    new_node = graph.get(old_id)
+                    if new_node and old_node.get('node_hash') == new_node.get('node_hash'):
+                        old_graph_ids.add(old_id)
 
-            if can_reuse:
-                vector_stores[repo_name] = prev_store
-            else:
-                store = VectorEmbeddingStore()
-                await store.build_index(graph)
-                vector_stores[repo_name] = store
+            store = VectorEmbeddingStore()
+            await store.update_index(graph, old_graph_ids=old_graph_ids, previous_store=prev_store)
+            vector_stores[repo_name] = store
 
             for node_id, node_data in graph.items():
-                combined_graph[node_data.get('global_id', _global_node_id(repo_name, node_data.get('file', ''), node_data.get('symbol', {}).get('name', node_id.split('::')[-1])))] = node_data
+                gid = node_data.get('global_id', _global_node_id(repo_name, node_data.get('file', ''), node_data.get('symbol', {}).get('name', node_id.split('::')[-1])))
+                combined_graph[gid] = node_data
 
-        # Cap global index: only for multi-repo setups and favor cross-repo/API-relevant nodes if huge.
         if len(multi_graph) > 1 and combined_graph:
             global_candidates = combined_graph
             if len(combined_graph) > 7000:
@@ -2606,10 +3269,15 @@ async def build_multi_symbol_graph(
                 global_store = VectorEmbeddingStore()
                 await global_store.build_index(global_candidates)
                 vector_stores['__global__'] = global_store
-    
+
     with open(GRAPH_FILE, 'w') as f:
         json.dump(multi_graph, f, indent=2)
-    
+
+    try:
+        export_graph_visualizations(multi_graph, VISUALIZATION_DIR)
+    except Exception as vis_err:
+        print(f"⚠️ Visualization export failed: {vis_err}")
+
     return multi_graph, vector_stores
 
 # --- Enhanced Selector ---
@@ -2715,6 +3383,101 @@ def _priority_graph_traverse(
     return selected
 
 
+def _compute_graph_centrality(active_graph: Dict[str, Dict]):
+    """Compute PageRank-based architectural importance."""
+    if not HAS_NETWORKX or not active_graph:
+        return
+
+    g = nx.DiGraph()
+    for nid, node in active_graph.items():
+        g.add_node(nid)
+        for dep in node.get('dependencies', []):
+            if dep in active_graph:
+                g.add_edge(nid, dep)
+
+    try:
+        pr = nx.pagerank(g, alpha=0.85)
+        for nid, score in pr.items():
+            if nid in active_graph:
+                active_graph[nid]['pagerank'] = float(score)
+                active_graph[nid]['centrality_score'] = min(float(score) * 50.0, 1.0)
+    except Exception as e:
+        print(f"⚠️ PageRank failed: {e}")
+
+
+def _apply_graph_distance_reranking(candidates: List[Tuple[float, str]], active_graph: Dict[str, Dict]) -> List[Tuple[float, str]]:
+    """Boost candidates that are topologically close to top anchor nodes."""
+    if not candidates or not HAS_NETWORKX:
+        return candidates
+
+    graph = _build_nx_graph(active_graph)
+    if graph is None:
+        return candidates
+
+    anchors = [nid for _, nid in sorted(candidates, reverse=True)[:3] if nid in graph]
+    if not anchors:
+        return candidates
+
+    reranked = []
+    for score, nid in candidates:
+        if nid not in graph:
+            reranked.append((score, nid))
+            continue
+
+        min_dist = 999
+        for anchor in anchors:
+            if anchor == nid:
+                min_dist = 0
+                break
+            try:
+                d = nx.shortest_path_length(graph, source=anchor, target=nid)
+                if d < min_dist:
+                    min_dist = d
+            except Exception:
+                continue
+
+        graph_boost = 0.0 if min_dist == 999 else (1.0 / (min_dist + 1.0))
+        reranked.append((score + (0.25 * graph_boost), nid))
+
+    reranked.sort(reverse=True, key=lambda x: x[0])
+    return reranked
+
+
+def _get_blast_radius(target_node_id: str, active_graph: Dict[str, Dict], max_depth: int = 2) -> List[str]:
+    """Reverse traversal impact report (who calls this node)."""
+    impact_report = []
+    visited = set()
+    queue = [(target_node_id, 0)]
+    impact_graph = defaultdict(list)
+
+    while queue:
+        curr, depth = queue.pop(0)
+        if depth > max_depth or curr in visited:
+            continue
+        visited.add(curr)
+
+        node = active_graph.get(curr)
+        if not node:
+            continue
+
+        impact_graph[depth].append(f"{node.get('file')}::{node.get('symbol', {}).get('name')}")
+        for caller in node.get('callers', []):
+            if caller not in visited:
+                queue.append((caller, depth + 1))
+
+    impact_report.append(f"### 💥 IMPACT ANALYSIS: {target_node_id}")
+    impact_report.append("Direct Callers (Immediate Breakage):")
+    for caller in impact_graph.get(1, []):
+        impact_report.append(f"- {caller}")
+
+    impact_report.append("\nIndirect Impact (Downstream Ripple):")
+    for depth in range(2, max_depth + 1):
+        for caller in impact_graph.get(depth, []):
+            impact_report.append(f"- (Depth {depth}) {caller}")
+
+    return ["\n".join(impact_report)]
+
+
 def _build_nx_graph(active_graph: Dict[str, Dict]) -> Optional[Any]:
     if not HAS_NETWORKX:
         return None
@@ -2762,6 +3525,7 @@ async def selector_agent_enhanced(
     summarizer: ProjectSummarizer = None
 ) -> List[str]:
     """Enhanced selector using vector search, graph traversal, and summaries."""
+    global LAST_SELECTOR_NODES
     print(f"🗂️ Selector: Strategy [{query_type}] in [{target_repo}]...", flush=True)
     
     if target_repo == "ALL" or target_repo not in multi_graph:
@@ -2789,7 +3553,35 @@ async def selector_agent_enhanced(
     
     if not active_graph and query_type != "HIGH_LEVEL":
         return []
-    
+
+    memory_match = _find_memory_match(technical_query)
+    if memory_match and active_graph:
+        mem_nodes = set(n for n in memory_match.get('selected_nodes', []) if n in active_graph)
+        if mem_nodes:
+            print("   🧠 Reusing memory-augmented retrieval hints")
+            LAST_SELECTOR_NODES = list(mem_nodes)
+            return build_context_with_budget(mem_nodes, active_graph, target_repo)
+
+    if query_type == "IMPACT" and active_graph:
+        specific_seeds = _extract_specific_targets(technical_query, hints or [], active_graph)
+        if not specific_seeds:
+            for repo, store in active_stores.items():
+                if store and HAS_FAISS:
+                    search_results = await store.search(technical_query, k=1)
+                    for result_id in search_results:
+                        if repo == '__global__':
+                            if result_id in active_graph:
+                                specific_seeds.add(result_id)
+                        elif target_repo == "ALL":
+                            node = multi_graph.get(repo, {}).get(result_id)
+                            if node:
+                                specific_seeds.add(node.get('global_id', result_id))
+                        elif result_id in active_graph:
+                            specific_seeds.add(result_id)
+        if specific_seeds:
+            LAST_SELECTOR_NODES = list(specific_seeds)
+            return _get_blast_radius(next(iter(specific_seeds)), active_graph, max_depth=3)
+
     selected_nodes = set()
     extra_context = []
     explanation_weight_mode = query_type == "HIGH_LEVEL" or bool(re.search(r"explain|how\s+.*works|architecture", technical_query, re.IGNORECASE))
@@ -2877,6 +3669,7 @@ async def selector_agent_enhanced(
         path_nodes = _find_shortest_path_nodes(active_graph, endpoint_candidates, db_candidates)
         selected_nodes.update(path_nodes)
 
+    LAST_SELECTOR_NODES = list(selected_nodes)
     context_strings = build_context_with_budget(selected_nodes, active_graph, target_repo)
     return extra_context + context_strings
 
@@ -3030,12 +3823,16 @@ async def autonomous_answering_loop(
 
         assessment = await llm_assess_context(user_query, context_pool)
         if assessment.get("status") == "ANSWERABLE":
-            return await answering_agent(user_query, context_pool)
+            answer = await answering_agent(user_query, context_pool)
+            _record_reasoning_memory(user_query, LAST_SELECTOR_NODES, answer)
+            return answer
 
         active_query = assessment.get("missing_info_query") or active_query
 
     if context_pool:
-        return await answering_agent(user_query, context_pool)
+        answer = await answering_agent(user_query, context_pool)
+        _record_reasoning_memory(user_query, LAST_SELECTOR_NODES, answer)
+        return answer
     return "I tried multiple retrieval passes but could not find enough evidence to answer confidently."
 
 def compress_context_strings(context_strings: List[str], token_budget: int = CONTEXT_COMPRESSION_TRIGGER_TOKENS) -> List[str]:
