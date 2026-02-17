@@ -4022,50 +4022,6 @@ def compress_context_strings(context_strings: List[str], token_budget: int = CON
 
 
 
-def _build_repo_identity_index(multi_graph: Dict[str, Dict]) -> Set[str]:
-    """Build lightweight repository identity terms for relevance checks."""
-    terms: Set[str] = set()
-    for graph in multi_graph.values():
-        for node_id, node in graph.items():
-            file_path = (node.get('file') or '').lower()
-            for part in re.split(r'[^a-z0-9_]+', file_path):
-                if len(part) >= 3:
-                    terms.add(part)
-
-            sym = (node.get('symbol', {}).get('name') or '').lower()
-            for part in re.split(r'[^a-z0-9_]+', sym):
-                if len(part) >= 3:
-                    terms.add(part)
-
-            node_tail = node_id.split('::')[-1].lower()
-            if len(node_tail) >= 3:
-                terms.add(node_tail)
-    return terms
-
-
-def safeguard_repo_relevance_agent(user_query: str, multi_graph: Dict[str, Dict]) -> Dict[str, str]:
-    """Fast relevance guard to block non-repository/off-topic questions before retrieval."""
-    query_terms = {t.lower() for t in re.findall(r"[a-zA-Z_][a-zA-Z0-9_]+", user_query)}
-
-    # If user asks clear code-centric questions, allow through.
-    code_markers = {
-        'file', 'function', 'class', 'method', 'repo', 'repository', 'module',
-        'import', 'api', 'endpoint', 'database', 'sql', 'bug', 'error', 'traceback',
-        'refactor', 'python', 'javascript', 'typescript', 'java', 'go', 'rust'
-    }
-    has_code_marker = bool(query_terms & code_markers)
-
-    identity_terms = _build_repo_identity_index(multi_graph)
-    identity_overlap = query_terms & identity_terms
-
-    if has_code_marker or identity_overlap:
-        return {'is_related': 'yes', 'reason': 'Query appears code/repo related.'}
-
-    if len(query_terms) <= 2:
-        return {'is_related': 'no', 'reason': 'Query is too short and has no repository identity overlap.'}
-
-    return {'is_related': 'no', 'reason': 'Query appears unrelated to repository contents.'}
-
 
 # --- Reframer ---
 
@@ -4303,19 +4259,6 @@ async def main():
             if query.lower() in ['exit', 'quit']:
                 break
             
-            guard_result = safeguard_repo_relevance_agent(query, multi_graph)
-            if guard_result.get('is_related') != 'yes':
-                answer = (
-                    "I can only help with questions related to this repository. "
-                    f"Reason: {guard_result.get('reason', 'unrelated query detected.')}"
-                )
-                print("\n" + "="*60)
-                print("🛡️ SAFEGUARD:")
-                print(answer)
-                print("="*60)
-                chat_history.append({"role": "user", "content": query})
-                chat_history.append({"role": "assistant", "content": answer})
-                continue
 
             reframer_res = await reframer_agent(query, chat_history, available_repos)
             
