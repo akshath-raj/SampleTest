@@ -2572,21 +2572,31 @@ Inherits: {', '.join(data.get('bases', []))}
             code_similarity = code_scores.get(node_id, 0.0)
             structure_similarity = struct_scores.get(node_id, 0.0)
             embedding_score = (0.6 * intent_similarity) + (0.25 * code_similarity) + (0.15 * structure_similarity)
-
             bm25_score = bm25_scores.get(node_id, 0.0)
             centrality_score = float(metadata.get('centrality_score', 0.0))
+            
+            # --- NEW: Direct Name Match Boost ---
+            symbol_name = metadata.get('symbol', {}).get('name', '')
+            name_match_boost = 0.0
+            
+            # If the query *is* the function name (exact match)
+            if query.strip() == symbol_name:
+                name_match_boost = 5.0  # Massive boost to force to top
+            
+            # If the query contains the function name (e.g. "what does processPayment do")
+            elif symbol_name and len(symbol_name) > 3 and symbol_name in query:
+                name_match_boost = 2.0
+            # -------------------------------------
+
             comments_blob = f"{metadata.get('docstring', '')}\n{metadata.get('comments_above', '')}"
             comment_bonus = _comment_keyword_overlap_score(query, comments_blob)
-            contextual_boost = _comment_contextual_boost(query, comments_blob)
-            quality_bonus = float(metadata.get('comment_quality', 0.0))
-
+            
             final_score = (
                 (EMBEDDING_WEIGHT * embedding_score)
                 + (BM25_WEIGHT * bm25_score)
                 + (CENTRALITY_WEIGHT * centrality_score)
                 + (COMMENT_MATCH_WEIGHT * comment_bonus)
-                + (0.05 * quality_bonus)
-                + contextual_boost
+                + name_match_boost  # <--- Add the boost here
             )
             candidates.append((final_score, node_id))
 
@@ -3283,22 +3293,43 @@ async def build_multi_symbol_graph(
 # --- Enhanced Selector ---
 
 def _extract_specific_targets(query: str, hints: List[str], active_graph: Dict) -> Set[str]:
-    """Extract matching node IDs based on hints from reframer."""
+    """
+    Extract matching node IDs based on hints AND direct query matches.
+    Now prioritizes exact symbol name matches from the query itself.
+    """
     targets = set()
-    node_keys = list(active_graph.keys())
     
-    for hint in hints:
-        hint_lower = hint.lower()
-        # Direct match
-        if hint in active_graph:
-            targets.add(hint)
+    # 1. Clean the query to treat it as a potential symbol
+    # Remove common punctuation but keep dots/underscores for names
+    direct_symbol_candidate = re.sub(r'[^\w\.]', '', query).strip()
+    
+    # Combine explicit hints with the direct query candidate
+    search_terms = set(hints)
+    if direct_symbol_candidate and len(direct_symbol_candidate) > 2:
+        search_terms.add(direct_symbol_candidate)
+
+    for node_id, node_data in active_graph.items():
+        # Get the actual symbol name (e.g., "processPayment")
+        # cleanly separated from the global ID (e.g., "gid::repo::file::processPayment")
+        symbol_name = node_data.get('symbol', {}).get('name', '')
+        
+        if not symbol_name:
             continue
+
+        # Check against all search terms
+        for term in search_terms:
+            # EXACT MATCH (High Priority)
+            if symbol_name == term:
+                targets.add(node_id)
             
-        # Partial match
-        for key in node_keys:
-            if hint_lower in key.lower():
-                targets.add(key)
+            # SUFFIX MATCH (Handles "User.login" matching "login")
+            elif symbol_name.endswith(f".{term}"):
+                targets.add(node_id)
                 
+            # FUZZY MATCH (Only if hint is long enough to avoid noise)
+            elif len(term) > 4 and term.lower() in symbol_name.lower():
+                targets.add(node_id)
+
     return targets
 
 def _node_expansion_priority(
@@ -3585,7 +3616,18 @@ async def selector_agent_enhanced(
     selected_nodes = set()
     extra_context = []
     explanation_weight_mode = query_type == "HIGH_LEVEL" or bool(re.search(r"explain|how\s+.*works|architecture", technical_query, re.IGNORECASE))
-
+    
+    # STRATEGY 0: DIRECT SYMBOL LOOKUP (New "Fast Path")
+    if active_graph:
+        direct_hits = _extract_specific_targets(technical_query, hints or [], active_graph)
+        if direct_hits:
+            print(f"   🎯 Direct Symbol Hit: Found {len(direct_hits)} exact matches.")
+            # We treat these as seeds and traverse their dependencies to give context
+            return build_context_with_budget(
+                _priority_graph_traverse(direct_hits, active_graph, technical_query, max_depth=1), 
+                active_graph, 
+                target_repo
+            )
     # Strategy 1: HIGH_LEVEL - Include Project, File and Folder Summaries
     if query_type == "HIGH_LEVEL" and summarizer:
         extra_context.append(f"=== PROJECT ARCHITECTURAL OVERVIEW ===\n\n{summarizer.project_summary}")
@@ -3693,7 +3735,7 @@ Query: "{query}"
 Available Nodes:
 {menu_str}
 
-TASK: Select 2-5 STARTING NODES (IDs) most relevant to the query.
+TASK: Select 3-10 STARTING NODES (IDs) most relevant to the query.
 Return JSON: {{"seed_nodes": ["node_id_1", "node_id_2"]}}
 """
     
