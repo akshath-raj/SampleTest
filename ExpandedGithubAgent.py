@@ -3331,22 +3331,82 @@ async def build_multi_symbol_graph(
 def _extract_specific_targets(query: str, hints: List[str], active_graph: Dict) -> Set[str]:
     """Tiered lookup to ensure target symbols are never missed."""
     targets = set()
+    file_targets = set()
     # Extract potential symbol names from the query (CamelCase, snake_case, or dotted)
     query_tokens = re.findall(r'[a-zA-Z_][a-zA-Z0-9_\.]*', query)
-    search_terms = set(hints or []) | set(query_tokens)
+    search_terms = {t.strip().lower() for t in (set(hints or []) | set(query_tokens)) if t and t.strip()}
+
+    # Build file lookup once so we can do high-priority exact filename targeting.
+    file_to_nodes = defaultdict(set)
+    base_to_nodes = defaultdict(set)
+    for node_id, node_data in active_graph.items():
+        file_path = (node_data.get('file', '') or '').strip()
+        if not file_path:
+            continue
+        file_lower = file_path.lower()
+        file_name = os.path.basename(file_lower)
+        base_name, _ = os.path.splitext(file_name)
+        file_to_nodes[file_lower].add(node_id)
+        file_to_nodes[file_name].add(node_id)
+        base_to_nodes[base_name].add(node_id)
+
+    # TIER 0: File-aware retrieval (must-fetch all symbols in explicitly named files).
+    for term in search_terms:
+        term_lower = term.lower()
+        if term_lower in file_to_nodes:
+            file_targets.update(file_to_nodes[term_lower])
+        if term_lower in base_to_nodes:
+            file_targets.update(base_to_nodes[term_lower])
+
+    if file_targets:
+        targets.update(file_targets)
 
     for node_id, node_data in active_graph.items():
         symbol_name = node_data.get('symbol', {}).get('name', '')
         if not symbol_name: continue
 
         for term in search_terms:
+            if term in {'what', 'is', 'in', 'the', 'a', 'an', 'show', 'file'}:
+                continue
             # TIER 1: Exact Match (Highest Priority)
-            if symbol_name == term:
+            if symbol_name.lower() == term:
                 targets.add(node_id)
             # TIER 2: Namespace/Script Match
-            elif symbol_name.endswith(f".{term}") or term in node_data.get('file', ''):
+            elif symbol_name.lower().endswith(f".{term}") or term in node_data.get('file', '').lower():
                 targets.add(node_id)
     return targets
+
+
+def _generate_project_structure_map(active_graph: Dict, max_entries: int = 800) -> str:
+    """Generate a compact tree-style project map from graph file paths."""
+    file_paths = sorted({(n.get('file') or '').strip() for n in active_graph.values() if n.get('file')})
+    if not file_paths:
+        return "(No indexed file paths available)"
+
+    tree = {}
+    for path in file_paths[:max_entries]:
+        parts = [p for p in path.split('/') if p]
+        cursor = tree
+        for idx, part in enumerate(parts):
+            is_leaf = idx == len(parts) - 1
+            cursor = cursor.setdefault(part, {} if not is_leaf else None)
+
+    lines = []
+
+    def _walk(node: Dict, prefix: str = ""):
+        keys = sorted(node.keys())
+        for i, key in enumerate(keys):
+            is_last = i == len(keys) - 1
+            branch = "└── " if is_last else "├── "
+            lines.append(f"{prefix}{branch}{key}")
+            child = node[key]
+            if isinstance(child, dict):
+                _walk(child, prefix + ("    " if is_last else "│   "))
+
+    _walk(tree)
+    if len(file_paths) > max_entries:
+        lines.append(f"... ({len(file_paths) - max_entries} more files omitted)")
+    return "\n".join(lines)
 
 def _node_expansion_priority(
     query: str,
@@ -3633,6 +3693,9 @@ async def selector_agent_enhanced(
 
     selected_nodes = set()
     extra_context = []
+    if active_graph:
+        structure_map = _generate_project_structure_map(active_graph)
+        extra_context.append(f"=== PROJECT STRUCTURE MAP ===\n\n{structure_map}")
     explanation_weight_mode = query_type == "HIGH_LEVEL" or bool(re.search(r"explain|how\s+.*works|architecture", technical_query, re.IGNORECASE))
     
     # --- STRATEGY 0: DIRECT SYMBOL LOOKUP (Corrected) ---
@@ -3656,8 +3719,14 @@ async def selector_agent_enhanced(
         anchor_nodes = _extract_specific_targets(technical_query, hints, active_graph)
         if anchor_nodes:
             # 1. Provide the Tree Map
-            extra_context.append(_build_impact_tree_text(anchor_nodes, active_graph))
-            # 2. Grab the actual code for the anchors and their immediate callers
+            extra_context.extend(_build_impact_tree_text(anchor_nodes, active_graph))
+            # 2. Provide structural blast radius summary
+            blast_radius_chunks = []
+            for anchor in list(anchor_nodes)[:3]:
+                blast_radius_chunks.extend(_get_blast_radius(anchor, active_graph, max_depth=3))
+            if blast_radius_chunks:
+                extra_context.append("=== STRUCTURAL BLAST RADIUS ===\n\n" + "\n\n".join(blast_radius_chunks))
+            # 3. Grab the actual code for the anchors and their immediate callers
             selected_nodes.update(anchor_nodes)
             selected_nodes.update(_priority_graph_traverse(anchor_nodes, active_graph, technical_query, max_depth=2, direction="callers"))
     
@@ -3952,6 +4021,52 @@ def compress_context_strings(context_strings: List[str], token_budget: int = CON
     return truncate_to_token_budget(compressed, token_budget)
 
 
+
+def _build_repo_identity_index(multi_graph: Dict[str, Dict]) -> Set[str]:
+    """Build lightweight repository identity terms for relevance checks."""
+    terms: Set[str] = set()
+    for graph in multi_graph.values():
+        for node_id, node in graph.items():
+            file_path = (node.get('file') or '').lower()
+            for part in re.split(r'[^a-z0-9_]+', file_path):
+                if len(part) >= 3:
+                    terms.add(part)
+
+            sym = (node.get('symbol', {}).get('name') or '').lower()
+            for part in re.split(r'[^a-z0-9_]+', sym):
+                if len(part) >= 3:
+                    terms.add(part)
+
+            node_tail = node_id.split('::')[-1].lower()
+            if len(node_tail) >= 3:
+                terms.add(node_tail)
+    return terms
+
+
+def safeguard_repo_relevance_agent(user_query: str, multi_graph: Dict[str, Dict]) -> Dict[str, str]:
+    """Fast relevance guard to block non-repository/off-topic questions before retrieval."""
+    query_terms = {t.lower() for t in re.findall(r"[a-zA-Z_][a-zA-Z0-9_]+", user_query)}
+
+    # If user asks clear code-centric questions, allow through.
+    code_markers = {
+        'file', 'function', 'class', 'method', 'repo', 'repository', 'module',
+        'import', 'api', 'endpoint', 'database', 'sql', 'bug', 'error', 'traceback',
+        'refactor', 'python', 'javascript', 'typescript', 'java', 'go', 'rust'
+    }
+    has_code_marker = bool(query_terms & code_markers)
+
+    identity_terms = _build_repo_identity_index(multi_graph)
+    identity_overlap = query_terms & identity_terms
+
+    if has_code_marker or identity_overlap:
+        return {'is_related': 'yes', 'reason': 'Query appears code/repo related.'}
+
+    if len(query_terms) <= 2:
+        return {'is_related': 'no', 'reason': 'Query is too short and has no repository identity overlap.'}
+
+    return {'is_related': 'no', 'reason': 'Query appears unrelated to repository contents.'}
+
+
 # --- Reframer ---
 
 async def reframer_agent(user_query: str, chat_history: List[Dict], available_repos: List[str]) -> Dict[str, Any]:
@@ -4188,6 +4303,20 @@ async def main():
             if query.lower() in ['exit', 'quit']:
                 break
             
+            guard_result = safeguard_repo_relevance_agent(query, multi_graph)
+            if guard_result.get('is_related') != 'yes':
+                answer = (
+                    "I can only help with questions related to this repository. "
+                    f"Reason: {guard_result.get('reason', 'unrelated query detected.')}"
+                )
+                print("\n" + "="*60)
+                print("🛡️ SAFEGUARD:")
+                print(answer)
+                print("="*60)
+                chat_history.append({"role": "user", "content": query})
+                chat_history.append({"role": "assistant", "content": answer})
+                continue
+
             reframer_res = await reframer_agent(query, chat_history, available_repos)
             
             answer = await autonomous_answering_loop(
