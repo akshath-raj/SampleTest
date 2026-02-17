@@ -820,6 +820,10 @@ def _extract_python_semantic_metadata(code: str) -> Dict[str, Any]:
 
 def _node_comment_summary(node: Dict[str, Any]) -> str:
     """Return the best available explanation comment for a node."""
+    selector_comment = (node.get('selector_comment') or '').strip()
+    if selector_comment:
+        return selector_comment
+
     doc = (node.get('docstring') or '').strip()
     above = (node.get('comments_above') or '').strip()
     summary = (doc.split("\n")[0] if doc else '') or (above.split("\n")[0] if above else '')
@@ -2664,6 +2668,52 @@ Inherits: {', '.join(data.get('bases', []))}
 
 # --- Graph Building ---
 
+
+
+def _extract_module_level_variables(filename: str, content: str) -> List[Dict[str, Any]]:
+    """Extract module-level assigns as variable nodes (constants/config/globals)."""
+    variables: List[Dict[str, Any]] = []
+    if not filename.endswith('.py'):
+        return variables
+
+    try:
+        tree = ast.parse(content)
+    except Exception:
+        return variables
+
+    for node in tree.body:
+        if not isinstance(node, ast.Assign):
+            continue
+        assign_src = ast.get_source_segment(content, node) or ''
+        for target in node.targets:
+            if not isinstance(target, ast.Name):
+                continue
+            var_name = target.id
+            var_type = 'constant' if var_name.isupper() else 'variable'
+            comment_meta = {
+                'docstring': f"Module-level {var_type} `{var_name}`.",
+                'comments_above': '',
+                'comment_ratio': 0.0,
+                'comment_quality': 0.2
+            }
+            variables.append({
+                'name': var_name,
+                'type': 'variable',
+                'code': assign_src,
+                'calls': [],
+                'api_route': None,
+                'api_outbound': [],
+                'arg_names': [],
+                'arg_types': [],
+                'return_type': None,
+                'variable_mentions': [var_name],
+                'exception_types': [],
+                'decorators': [],
+                'bases': [],
+                **comment_meta
+            })
+    return variables
+
 async def build_single_repo_graph(
     repo_name: str,
     files_data: Dict[str, Dict],
@@ -2744,7 +2794,9 @@ async def build_single_repo_graph(
     file_globals = {}
     for filename, result in parsed_data.items():
         file_globals[filename] = result['globals']
-        for node in result['nodes']:
+        synthetic_variables = _extract_module_level_variables(filename, files_data[filename]['content'])
+        all_nodes = list(result['nodes']) + synthetic_variables
+        for node in all_nodes:
             name = node['name']
             symbol_registry[name].append({
                 "file": filename,
@@ -2770,7 +2822,9 @@ async def build_single_repo_graph(
     defined_symbols = set(symbol_registry.keys())
 
     for filename, result in parsed_data.items():
-        for node in result['nodes']:
+        synthetic_variables = _extract_module_level_variables(filename, files_data[filename]['content'])
+        all_nodes = list(result['nodes']) + synthetic_variables
+        for node in all_nodes:
             sym_name = node['name']
             node_id = f"{filename}::{sym_name}"
             valid_deps = []
@@ -3053,6 +3107,21 @@ async def build_single_repo_graph(
         ndata['dependencies'] = [dep for dep in ndata.get('dependencies', []) if dep in graph]
         ndata['callers'] = []
 
+    # Link function/class nodes to module-level variable nodes when referenced in variable_mentions.
+    variable_nodes_by_file = defaultdict(dict)
+    for nid, ndata in graph.items():
+        if ndata.get('type') == 'variable':
+            variable_nodes_by_file[ndata.get('file', '')][ndata.get('symbol', {}).get('name', '')] = nid
+
+    for nid, ndata in graph.items():
+        if ndata.get('type') in {'variable', 'module', 'folder', 'package_dependencies', 'external_library'}:
+            continue
+        file_vars = variable_nodes_by_file.get(ndata.get('file', ''), {})
+        mentions = set(ndata.get('variable_mentions', []) or [])
+        for var_name, var_nid in file_vars.items():
+            if var_name in mentions and var_nid != nid and var_nid not in ndata['dependencies']:
+                ndata['dependencies'].append(var_nid)
+
     for source_id, source_data in graph.items():
         for target_id in source_data.get('dependencies', []):
             if target_id in graph and source_id not in graph[target_id]['callers']:
@@ -3254,10 +3323,109 @@ def _ensure_node_commentary(graph: Dict[str, Dict[str, Any]]) -> None:
     """Guarantee each node has an explanatory comment field for selector reasoning."""
     for node in graph.values():
         summary = _node_comment_summary(node)
+        node['selector_comment'] = summary
         if not (node.get('docstring') or '').strip():
             node['docstring'] = summary
         if not (node.get('comments_above') or '').strip():
             node['comments_above'] = summary
+
+
+async def _enrich_missing_node_comments(graph: Dict[str, Dict[str, Any]], repo_name: str, batch_size: int = 20, max_nodes: int = 80) -> None:
+    """Fast LLM enrichment pass for symbols lacking meaningful comments/docstrings."""
+    candidates = []
+    for node_id, node in graph.items():
+        if node.get('type') not in {'function', 'method', 'class'}:
+            continue
+        if (node.get('docstring') or '').strip() or (node.get('comments_above') or '').strip():
+            continue
+        snippet = (node.get('code') or '').strip()
+        if not snippet:
+            continue
+        candidates.append((node_id, node, snippet[:700]))
+
+    if not candidates:
+        return
+
+    candidates = candidates[:max_nodes]
+    print(f"   ✨ Enricher: generating intent comments for {len(candidates)} symbols in [{repo_name}]...")
+
+    for i in range(0, len(candidates), batch_size):
+        batch = candidates[i:i + batch_size]
+        payload = []
+        for node_id, node, snippet in batch:
+            payload.append({
+                "node_id": node_id,
+                "file": node.get('file', ''),
+                "symbol": node.get('symbol', {}).get('name', ''),
+                "type": node.get('type', ''),
+                "code": snippet
+            })
+
+        prompt = f"""
+You are an intent-enricher for a code graph.
+Create one concise comment per symbol (max 18 words) describing what the symbol does.
+Do not invent behavior not present in code.
+
+Return strict JSON:
+{{
+  "items": [
+    {{"node_id": "...", "comment": "..."}}
+  ]
+}}
+
+Symbols:
+{json.dumps(payload, ensure_ascii=False)}
+"""
+
+        try:
+            res = await safe_chat_completion(
+                model=MODEL_NAME,
+                messages=[{"role": "user", "content": prompt}],
+                response_format={"type": "json_object"}
+            )
+            parsed = json.loads(res.choices[0].message.content)
+            for item in parsed.get('items', []):
+                nid = item.get('node_id')
+                comment = (item.get('comment') or '').strip()
+                if nid in graph and comment:
+                    graph[nid]['selector_comment'] = comment
+                    if not (graph[nid].get('docstring') or '').strip():
+                        graph[nid]['docstring'] = comment
+                    if not (graph[nid].get('comments_above') or '').strip():
+                        graph[nid]['comments_above'] = comment
+        except Exception:
+            continue
+
+
+def _build_navigation_index(active_graph: Dict[str, Dict], summarizer: Optional['ProjectSummarizer'] = None, max_files: int = 120) -> str:
+    """Build hierarchical navigation index: folders -> files -> key symbols with comments."""
+    files = defaultdict(list)
+    for node in active_graph.values():
+        files[node.get('file', '')].append(node)
+
+    lines = ["=== NAVIGATION INDEX ==="]
+    if summarizer and summarizer.project_summary:
+        lines.append(f"PROJECT: {summarizer.project_summary}")
+
+    for file_path in sorted([f for f in files.keys() if f])[:max_files]:
+        file_nodes = files[file_path]
+        file_summary = (summarizer.file_summaries.get(file_path, "") if summarizer else "")
+        lines.append(f"\nFILE: {file_path}")
+        if file_summary:
+            lines.append(f"  Summary: {file_summary}")
+        for node in sorted(file_nodes, key=lambda n: n.get('symbol', {}).get('name', ''))[:20]:
+            symbol = node.get('symbol', {}).get('name', 'unknown')
+            ntype = node.get('type', 'symbol')
+            comment = _node_comment_summary(node)
+            lines.append(f"  - [{ntype}] {symbol}: {comment}")
+
+    folder_summaries = getattr(summarizer, 'folder_summaries', {}) if summarizer else {}
+    if folder_summaries:
+        lines.append("\nFOLDER OVERVIEW:")
+        for folder, summary in list(folder_summaries.items())[:40]:
+            lines.append(f"  - {folder}: {summary}")
+
+    return "\n".join(lines)
 
 
 async def build_multi_symbol_graph(
@@ -3290,6 +3458,8 @@ async def build_multi_symbol_graph(
             previous_graph=(previous_graph or {}).get(repo_name, {}),
             changed_files=changed_files if previous_graph else None
         )
+        _ensure_node_commentary(graph)
+        await _enrich_missing_node_comments(graph, repo_name)
         _ensure_node_commentary(graph)
 
         print(f"   📝 Summarizing {len(files_data)} files in [{repo_name}]...")
@@ -3742,13 +3912,7 @@ async def selector_agent_enhanced(
     if active_graph:
         structure_map = _generate_project_structure_map(active_graph)
         extra_context.append(f"=== PROJECT STRUCTURE MAP ===\n\n{structure_map}")
-    if summarizer:
-        file_sum_str = "\n".join([f"- {f}: {s}" for f, s in list(summarizer.file_summaries.items())[:30]])
-        folder_sum_str = "\n".join([f"- {f}: {s}" for f, s in list(summarizer.folder_summaries.items())[:20]])
-        if file_sum_str:
-            extra_context.append(f"=== FILE OVERVIEW (for selector) ===\n\n{file_sum_str}")
-        if folder_sum_str:
-            extra_context.append(f"=== FOLDER OVERVIEW (for selector) ===\n\n{folder_sum_str}")
+        extra_context.append(_build_navigation_index(active_graph, summarizer))
     explanation_weight_mode = query_type == "HIGH_LEVEL" or bool(re.search(r"explain|how\s+.*works|architecture", technical_query, re.IGNORECASE))
 
     # --- STRATEGY 0: DIRECT SYMBOL LOOKUP (Corrected) ---
@@ -4182,7 +4346,7 @@ async def answering_agent(user_query: str, context_strings: List[str]) -> str:
     print(f"   📊 Context size: {context_tokens} tokens")
     
     messages = [
-        {"role": "system", "content": "You are a senior developer. Answer based strictly on the provided Code Context. Be specific and cite file names when relevant."},
+        {"role": "system", "content": "You are the Lead Architect for this codebase. You have high-fidelity context access. Analyze deeply, prioritize correctness over brevity, and ground every claim in the provided Code Context with specific file-level references."},
         {"role": "user", "content": f"Query: {user_query}\n\nCode Context:\n{full_context}"}
     ]
     
