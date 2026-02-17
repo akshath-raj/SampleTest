@@ -818,25 +818,58 @@ def _extract_python_semantic_metadata(code: str) -> Dict[str, Any]:
     return meta
 
 
-def reconstruct_file_slice(file_globals: str, nodes: List[Dict[str, Any]], anchor_ids: Set[str] = None) -> str:
-    """Builds a smart slice: Full code for anchors, signatures for context."""
+def _node_comment_summary(node: Dict[str, Any]) -> str:
+    """Return the best available explanation comment for a node."""
+    doc = (node.get('docstring') or '').strip()
+    above = (node.get('comments_above') or '').strip()
+    summary = (doc.split("\n")[0] if doc else '') or (above.split("\n")[0] if above else '')
+    if summary:
+        return summary
+
+    symbol = node.get('symbol', {}).get('name', 'unknown')
+    ntype = node.get('type', 'symbol')
+    return f"Auto-summary: {ntype} `{symbol}` from {node.get('file', 'unknown file')}."
+
+
+def reconstruct_file_slice(
+    file_globals: str,
+    nodes: List[Dict[str, Any]],
+    anchor_ids: Set[str] = None,
+    user_query: str = ""
+) -> str:
+    """Build high-fidelity slices: anchor files include full code for every symbol."""
     block = f"--- FILE GLOBALS ---\n{file_globals}\n" if file_globals else ""
     anchor_ids = anchor_ids or set()
 
+    anchor_files = {
+        n.get('file')
+        for n in nodes
+        if n.get('global_id') in anchor_ids or n.get('node_id') in anchor_ids
+    }
+
     for node in nodes:
         name = node.get('symbol', {}).get('name', 'unknown')
-        is_anchor = node.get('global_id') in anchor_ids or node.get('node_id') in anchor_ids
+        summary = _node_comment_summary(node)
+        is_anchor_symbol = node.get('global_id') in anchor_ids or node.get('node_id') in anchor_ids
+        is_anchor_file = bool(anchor_files) and node.get('file') in anchor_files
 
-        if is_anchor:
-            block += f"\n// FULL SYMBOL: {name}\n{node.get('code', '')}\n"
+        if is_anchor_symbol or is_anchor_file:
+            block += f"\n// COMMENT: {summary}\n// FULL SYMBOL: {name}\n{node.get('code', '')}\n"
         else:
-            # SKELETAL VIEW: Just the signature and docstring
-            doc = node.get('docstring', '').split('\n')[0]
-            block += f"\n// CONTEXT ONLY: {node.get('type')} {name}\n// Doc: {doc}\n// [Implementation hidden to save tokens]\n"
+            block += (
+                f"\n// COMMENT: {summary}\n"
+                f"// CONTEXT ONLY: {node.get('type')} {name}\n"
+                f"// [Implementation hidden to save tokens]\n"
+            )
+
+    if user_query:
+        block += f"\n// USER_QUERY_CONTEXT: {user_query}\n"
+
     return block
 
 
 def compute_file_content_hash(content: str) -> str:
+
     return hashlib.md5(content.encode('utf-8', errors='ignore')).hexdigest()
 
 
@@ -3216,6 +3249,17 @@ def _build_impact_tree_text(seeds, active_graph, depth=3):
         
     return "\n".join(tree_lines)
 
+
+def _ensure_node_commentary(graph: Dict[str, Dict[str, Any]]) -> None:
+    """Guarantee each node has an explanatory comment field for selector reasoning."""
+    for node in graph.values():
+        summary = _node_comment_summary(node)
+        if not (node.get('docstring') or '').strip():
+            node['docstring'] = summary
+        if not (node.get('comments_above') or '').strip():
+            node['comments_above'] = summary
+
+
 async def build_multi_symbol_graph(
     multi_repo_data: Dict[str, Dict],
     summarizer: ProjectSummarizer,
@@ -3246,6 +3290,7 @@ async def build_multi_symbol_graph(
             previous_graph=(previous_graph or {}).get(repo_name, {}),
             changed_files=changed_files if previous_graph else None
         )
+        _ensure_node_commentary(graph)
 
         print(f"   📝 Summarizing {len(files_data)} files in [{repo_name}]...")
         if changed_files:
@@ -3682,7 +3727,7 @@ async def selector_agent_enhanced(
         if mem_nodes:
             print("    🧠 Reusing memory-augmented retrieval hints")
             LAST_SELECTOR_NODES = list(mem_nodes)
-            return build_context_with_budget(mem_nodes, active_graph, target_repo)
+            return build_context_with_budget(mem_nodes, active_graph, target_repo, user_query=technical_query)
 
     # --- 4. Impact Analysis (Keep existing) ---
     if query_type == "IMPACT" and active_graph:
@@ -3692,23 +3737,34 @@ async def selector_agent_enhanced(
             return _get_blast_radius(next(iter(specific_seeds)), active_graph, max_depth=3)
 
     selected_nodes = set()
+    anchor_ids = set()
     extra_context = []
     if active_graph:
         structure_map = _generate_project_structure_map(active_graph)
         extra_context.append(f"=== PROJECT STRUCTURE MAP ===\n\n{structure_map}")
+    if summarizer:
+        file_sum_str = "\n".join([f"- {f}: {s}" for f, s in list(summarizer.file_summaries.items())[:30]])
+        folder_sum_str = "\n".join([f"- {f}: {s}" for f, s in list(summarizer.folder_summaries.items())[:20]])
+        if file_sum_str:
+            extra_context.append(f"=== FILE OVERVIEW (for selector) ===\n\n{file_sum_str}")
+        if folder_sum_str:
+            extra_context.append(f"=== FOLDER OVERVIEW (for selector) ===\n\n{folder_sum_str}")
     explanation_weight_mode = query_type == "HIGH_LEVEL" or bool(re.search(r"explain|how\s+.*works|architecture", technical_query, re.IGNORECASE))
-    
+
     # --- STRATEGY 0: DIRECT SYMBOL LOOKUP (Corrected) ---
     if active_graph:
         direct_hits = _extract_specific_targets(technical_query, hints or [], active_graph)
         if direct_hits:
             print(f"    🎯 Direct Symbol Hit: Found {len(direct_hits)} matches.")
+            anchor_ids.update(direct_hits)
             # If specifically asked for these, return immediately
             if query_type == "SPECIFIC":
                  return build_context_with_budget(
                     _priority_graph_traverse(direct_hits, active_graph, technical_query, max_depth=1), 
                     active_graph, 
-                    target_repo
+                    target_repo,
+                    anchor_ids=anchor_ids,
+                    user_query=technical_query
                 )
             # Otherwise, add to selection and continue
             seed_nodes = _priority_graph_traverse(direct_hits, active_graph, technical_query, max_depth=1)
@@ -3718,6 +3774,7 @@ async def selector_agent_enhanced(
     if query_type == "IMPACT" or "remove" in technical_query.lower():
         anchor_nodes = _extract_specific_targets(technical_query, hints, active_graph)
         if anchor_nodes:
+            anchor_ids.update(anchor_nodes)
             # 1. Provide the Tree Map
             extra_context.extend(_build_impact_tree_text(anchor_nodes, active_graph))
             # 2. Provide structural blast radius summary
@@ -3797,7 +3854,8 @@ async def selector_agent_enhanced(
                             seed_scores[full_id] = max(seed_scores.get(full_id, 0.0), store.last_scores[result_id])
         
         if not seed_nodes:
-            seed_nodes = await llm_seed_selection(technical_query, active_graph)
+            selector_overview = "\n".join(extra_context[:3])
+            seed_nodes = await llm_seed_selection(technical_query, active_graph, selector_overview)
             
         depth = 2 if explanation_weight_mode else (3 if query_type == "FUNCTIONAL_AREA" else MAX_RECURSION_DEPTH)
         selected_nodes.update(_priority_graph_traverse(
@@ -3825,10 +3883,16 @@ async def selector_agent_enhanced(
         selected_nodes.update(path_nodes)
 
     LAST_SELECTOR_NODES = list(selected_nodes)
-    context_strings = build_context_with_budget(selected_nodes, active_graph, target_repo)
+    context_strings = build_context_with_budget(
+        selected_nodes,
+        active_graph,
+        target_repo,
+        anchor_ids=anchor_ids,
+        user_query=technical_query
+    )
     return extra_context + context_strings
 
-async def llm_seed_selection(query: str, active_graph: Dict) -> Set[str]:
+async def llm_seed_selection(query: str, active_graph: Dict, selector_overview: str = "") -> Set[str]:
     """Fallback LLM-based seed selection."""
     keys = list(active_graph.keys())[:800]
     
@@ -3845,9 +3909,14 @@ async def llm_seed_selection(query: str, active_graph: Dict) -> Set[str]:
 You are a Code Navigator.
 Query: "{query}"
 
+Project/File Overview:
+{selector_overview or '(not available)'}
+
 Available Nodes:
 {menu_str}
 
+Each node includes a COMMENT that describes what it does.
+Prioritize nodes whose comment and file placement best match the query intent.
 TASK: Select 3-10 STARTING NODES (IDs) most relevant to the query.
 Return JSON: {{"seed_nodes": ["node_id_1", "node_id_2"]}}
 """
@@ -3867,7 +3936,9 @@ Return JSON: {{"seed_nodes": ["node_id_1", "node_id_2"]}}
 def build_context_with_budget(
     selected_nodes: Set[str],
     active_graph: Dict,
-    target_repo: str
+    target_repo: str,
+    anchor_ids: Optional[Set[str]] = None,
+    user_query: str = ""
 ) -> List[str]:
     """Build context strings with token budgeting using dynamic code slicing."""
 
@@ -3906,7 +3977,7 @@ def build_context_with_budget(
         block += f"### Sliced symbols in this block: {len(data['nodes'])}\n"
         block += f"############################################################\n\n"
 
-        block += reconstruct_file_slice(data['globals'], data['nodes'])
+        block += reconstruct_file_slice(data['globals'], data['nodes'], anchor_ids=anchor_ids or set(), user_query=user_query)
         block += "\n\n"
         context_blocks.append(block)
 
@@ -3918,16 +3989,21 @@ async def llm_assess_context(user_query: str, context_strings: List[str]) -> Dic
     """Assess whether current retrieved context is sufficient to answer."""
     preview = "\n\n".join(context_strings[:4])[:6000]
     prompt = f"""
-You are a retrieval planner for a code reasoning system.
+You are a strict retrieval sufficiency judge for code reasoning.
 User query: {user_query}
 Current context preview:
 {preview}
+
+Rules:
+- If the answer depends on implementation details that seem hidden, truncated, or missing, return NEED_MORE_CONTEXT.
+- If relevant anchor/target files are not fully visible, return NEED_MORE_CONTEXT.
+- Only return ANSWERABLE when the current context is sufficient to answer with concrete code-grounded detail.
 
 Return strict JSON with:
 {{
   "status": "ANSWERABLE" | "NEED_MORE_CONTEXT",
   "missing_info_query": "targeted follow-up query if more context is needed",
-  "reason": "short reason"
+  "reason": "explicitly mention missing/hidden code when applicable"
 }}
 """
     try:
