@@ -819,7 +819,7 @@ def _extract_python_semantic_metadata(code: str) -> Dict[str, Any]:
 
 
 def reconstruct_file_slice(file_globals: str, nodes: List[Dict[str, Any]], anchor_ids: Set[str] = None) -> str:
-    """Builds a smart slice: Full code for anchors, signatures for context."""
+    """Build a file slice: full code for anchor nodes, skeletal context for non-anchors."""
     block = f"--- FILE GLOBALS ---\n{file_globals}\n" if file_globals else ""
     anchor_ids = anchor_ids or set()
 
@@ -4074,14 +4074,17 @@ def build_context_with_budget(
         files_context[display_name]["globals"] = node.get('globals', '')
         files_context[display_name]["nodes"].append(node)
 
+    # Keep explicit selections first so full function bodies are retained under budget.
+    anchor_ids = set(selected_nodes)
     context_blocks = []
     for fname, data in files_context.items():
+        data['nodes'].sort(key=lambda n: 0 if (n.get('global_id') in anchor_ids or n.get('node_id') in anchor_ids) else 1)
         block = f"############################################################\n"
         block += f"### FILE: {fname}\n"
         block += f"### Sliced symbols in this block: {len(data['nodes'])}\n"
         block += f"############################################################\n\n"
 
-        block += reconstruct_file_slice(data['globals'], data['nodes'])
+        block += reconstruct_file_slice(data['globals'], data['nodes'], anchor_ids=anchor_ids)
         block += "\n\n"
         context_blocks.append(block)
 
