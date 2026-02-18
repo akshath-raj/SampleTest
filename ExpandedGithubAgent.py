@@ -818,16 +818,60 @@ def _extract_python_semantic_metadata(code: str) -> Dict[str, Any]:
     return meta
 
 
-def render_full_nodes(file_globals: str, nodes: List[Dict[str, Any]]) -> str:
-    """Render full code for all selected nodes."""
+def _node_comment_summary(node: Dict[str, Any]) -> str:
+    """Return the best available explanation comment for a node."""
+    selector_comment = (node.get('selector_comment') or '').strip()
+    if selector_comment:
+        return selector_comment
+
+    doc = (node.get('docstring') or '').strip()
+    above = (node.get('comments_above') or '').strip()
+    summary = (doc.split("\n")[0] if doc else '') or (above.split("\n")[0] if above else '')
+    if summary:
+        return summary
+
+    symbol = node.get('symbol', {}).get('name', 'unknown')
+    ntype = node.get('type', 'symbol')
+    return f"Auto-summary: {ntype} `{symbol}` from {node.get('file', 'unknown file')}."
+
+
+def reconstruct_file_slice(
+    file_globals: str,
+    nodes: List[Dict[str, Any]],
+    anchor_ids: Set[str] = None,
+    user_query: str = ""
+) -> str:
+    """Build high-fidelity slices: anchor files include full code for every symbol."""
     block = f"--- FILE GLOBALS ---\n{file_globals}\n" if file_globals else ""
+
+    anchor_files = {
+        n.get('file')
+        for n in nodes
+        if n.get('global_id') in anchor_ids or n.get('node_id') in anchor_ids
+    }
 
     for node in nodes:
         name = node.get('symbol', {}).get('name', 'unknown')
-        block += f"\n// SYMBOL: {name}\n{node.get('code', '')}\n"
+        summary = _node_comment_summary(node)
+        is_anchor_symbol = node.get('global_id') in anchor_ids or node.get('node_id') in anchor_ids
+        is_anchor_file = bool(anchor_files) and node.get('file') in anchor_files
+
+        if is_anchor_symbol or is_anchor_file:
+            block += f"\n// COMMENT: {summary}\n// FULL SYMBOL: {name}\n{node.get('code', '')}\n"
+        else:
+            block += (
+                f"\n// COMMENT: {summary}\n"
+                f"// CONTEXT ONLY: {node.get('type')} {name}\n"
+                f"// [Implementation hidden to save tokens]\n"
+            )
+
+    if user_query:
+        block += f"\n// USER_QUERY_CONTEXT: {user_query}\n"
+
     return block
 
 def compute_file_content_hash(content: str) -> str:
+
     return hashlib.md5(content.encode('utf-8', errors='ignore')).hexdigest()
 
 
@@ -2827,6 +2871,52 @@ def _mark_dead_code_candidates(graph: Dict[str, Dict]):
 
 # --- Graph Building ---
 
+
+
+def _extract_module_level_variables(filename: str, content: str) -> List[Dict[str, Any]]:
+    """Extract module-level assigns as variable nodes (constants/config/globals)."""
+    variables: List[Dict[str, Any]] = []
+    if not filename.endswith('.py'):
+        return variables
+
+    try:
+        tree = ast.parse(content)
+    except Exception:
+        return variables
+
+    for node in tree.body:
+        if not isinstance(node, ast.Assign):
+            continue
+        assign_src = ast.get_source_segment(content, node) or ''
+        for target in node.targets:
+            if not isinstance(target, ast.Name):
+                continue
+            var_name = target.id
+            var_type = 'constant' if var_name.isupper() else 'variable'
+            comment_meta = {
+                'docstring': f"Module-level {var_type} `{var_name}`.",
+                'comments_above': '',
+                'comment_ratio': 0.0,
+                'comment_quality': 0.2
+            }
+            variables.append({
+                'name': var_name,
+                'type': 'variable',
+                'code': assign_src,
+                'calls': [],
+                'api_route': None,
+                'api_outbound': [],
+                'arg_names': [],
+                'arg_types': [],
+                'return_type': None,
+                'variable_mentions': [var_name],
+                'exception_types': [],
+                'decorators': [],
+                'bases': [],
+                **comment_meta
+            })
+    return variables
+
 async def build_single_repo_graph(
     repo_name: str,
     files_data: Dict[str, Dict],
@@ -2907,7 +2997,9 @@ async def build_single_repo_graph(
     file_globals = {}
     for filename, result in parsed_data.items():
         file_globals[filename] = result['globals']
-        for node in result['nodes']:
+        synthetic_variables = _extract_module_level_variables(filename, files_data[filename]['content'])
+        all_nodes = list(result['nodes']) + synthetic_variables
+        for node in all_nodes:
             name = node['name']
             symbol_registry[name].append({
                 "file": filename,
@@ -2933,7 +3025,9 @@ async def build_single_repo_graph(
     defined_symbols = set(symbol_registry.keys())
 
     for filename, result in parsed_data.items():
-        for node in result['nodes']:
+        synthetic_variables = _extract_module_level_variables(filename, files_data[filename]['content'])
+        all_nodes = list(result['nodes']) + synthetic_variables
+        for node in all_nodes:
             sym_name = node['name']
             node_id = f"{filename}::{sym_name}"
             valid_deps = []
@@ -3238,6 +3332,21 @@ async def build_single_repo_graph(
         ndata['dependencies'] = [dep for dep in ndata.get('dependencies', []) if dep in graph]
         ndata['callers'] = []
 
+    # Link function/class nodes to module-level variable nodes when referenced in variable_mentions.
+    variable_nodes_by_file = defaultdict(dict)
+    for nid, ndata in graph.items():
+        if ndata.get('type') == 'variable':
+            variable_nodes_by_file[ndata.get('file', '')][ndata.get('symbol', {}).get('name', '')] = nid
+
+    for nid, ndata in graph.items():
+        if ndata.get('type') in {'variable', 'module', 'folder', 'package_dependencies', 'external_library'}:
+            continue
+        file_vars = variable_nodes_by_file.get(ndata.get('file', ''), {})
+        mentions = set(ndata.get('variable_mentions', []) or [])
+        for var_name, var_nid in file_vars.items():
+            if var_name in mentions and var_nid != nid and var_nid not in ndata['dependencies']:
+                ndata['dependencies'].append(var_nid)
+
     for source_id, source_data in graph.items():
         for target_id in source_data.get('dependencies', []):
             if target_id in graph and source_id not in graph[target_id]['callers']:
@@ -3451,6 +3560,116 @@ def _build_impact_tree_text(seeds, active_graph, depth=3):
         
     return "\n".join(tree_lines)
 
+
+def _ensure_node_commentary(graph: Dict[str, Dict[str, Any]]) -> None:
+    """Guarantee each node has an explanatory comment field for selector reasoning."""
+    for node in graph.values():
+        summary = _node_comment_summary(node)
+        node['selector_comment'] = summary
+        if not (node.get('docstring') or '').strip():
+            node['docstring'] = summary
+        if not (node.get('comments_above') or '').strip():
+            node['comments_above'] = summary
+
+
+async def _enrich_missing_node_comments(graph: Dict[str, Dict[str, Any]], repo_name: str, batch_size: int = 20, max_nodes: int = 80) -> None:
+    """Fast LLM enrichment pass for symbols lacking meaningful comments/docstrings."""
+    candidates = []
+    for node_id, node in graph.items():
+        if node.get('type') not in {'function', 'method', 'class'}:
+            continue
+        if (node.get('docstring') or '').strip() or (node.get('comments_above') or '').strip():
+            continue
+        snippet = (node.get('code') or '').strip()
+        if not snippet:
+            continue
+        candidates.append((node_id, node, snippet[:700]))
+
+    if not candidates:
+        return
+
+    candidates = candidates[:max_nodes]
+    print(f"   ✨ Enricher: generating intent comments for {len(candidates)} symbols in [{repo_name}]...")
+
+    for i in range(0, len(candidates), batch_size):
+        batch = candidates[i:i + batch_size]
+        payload = []
+        for node_id, node, snippet in batch:
+            payload.append({
+                "node_id": node_id,
+                "file": node.get('file', ''),
+                "symbol": node.get('symbol', {}).get('name', ''),
+                "type": node.get('type', ''),
+                "code": snippet
+            })
+
+        prompt = f"""
+You are an intent-enricher for a code graph.
+Create one concise comment per symbol (max 18 words) describing what the symbol does.
+Do not invent behavior not present in code.
+
+Return strict JSON:
+{{
+  "items": [
+    {{"node_id": "...", "comment": "..."}}
+  ]
+}}
+
+Symbols:
+{json.dumps(payload, ensure_ascii=False)}
+"""
+
+        try:
+            res = await safe_chat_completion(
+                model=MODEL_NAME,
+                messages=[{"role": "user", "content": prompt}],
+                response_format={"type": "json_object"}
+            )
+            parsed = json.loads(res.choices[0].message.content)
+            for item in parsed.get('items', []):
+                nid = item.get('node_id')
+                comment = (item.get('comment') or '').strip()
+                if nid in graph and comment:
+                    graph[nid]['selector_comment'] = comment
+                    if not (graph[nid].get('docstring') or '').strip():
+                        graph[nid]['docstring'] = comment
+                    if not (graph[nid].get('comments_above') or '').strip():
+                        graph[nid]['comments_above'] = comment
+        except Exception:
+            continue
+
+
+def _build_navigation_index(active_graph: Dict[str, Dict], summarizer: Optional['ProjectSummarizer'] = None, max_files: int = 120) -> str:
+    """Build hierarchical navigation index: folders -> files -> key symbols with comments."""
+    files = defaultdict(list)
+    for node in active_graph.values():
+        files[node.get('file', '')].append(node)
+
+    lines = ["=== NAVIGATION INDEX ==="]
+    if summarizer and summarizer.project_summary:
+        lines.append(f"PROJECT: {summarizer.project_summary}")
+
+    for file_path in sorted([f for f in files.keys() if f])[:max_files]:
+        file_nodes = files[file_path]
+        file_summary = (summarizer.file_summaries.get(file_path, "") if summarizer else "")
+        lines.append(f"\nFILE: {file_path}")
+        if file_summary:
+            lines.append(f"  Summary: {file_summary}")
+        for node in sorted(file_nodes, key=lambda n: n.get('symbol', {}).get('name', ''))[:20]:
+            symbol = node.get('symbol', {}).get('name', 'unknown')
+            ntype = node.get('type', 'symbol')
+            comment = _node_comment_summary(node)
+            lines.append(f"  - [{ntype}] {symbol}: {comment}")
+
+    folder_summaries = getattr(summarizer, 'folder_summaries', {}) if summarizer else {}
+    if folder_summaries:
+        lines.append("\nFOLDER OVERVIEW:")
+        for folder, summary in list(folder_summaries.items())[:40]:
+            lines.append(f"  - {folder}: {summary}")
+
+    return "\n".join(lines)
+
+
 async def build_multi_symbol_graph(
     multi_repo_data: Dict[str, Dict],
     summarizer: ProjectSummarizer,
@@ -3481,6 +3700,9 @@ async def build_multi_symbol_graph(
             previous_graph=(previous_graph or {}).get(repo_name, {}),
             changed_files=changed_files if previous_graph else None
         )
+        _ensure_node_commentary(graph)
+        await _enrich_missing_node_comments(graph, repo_name)
+        _ensure_node_commentary(graph)
 
         print(f"   📝 Summarizing {len(files_data)} files in [{repo_name}]...")
         if changed_files:
@@ -3566,83 +3788,82 @@ async def build_multi_symbol_graph(
 def _extract_specific_targets(query: str, hints: List[str], active_graph: Dict) -> Set[str]:
     """Tiered lookup to ensure target symbols are never missed."""
     targets = set()
+    file_targets = set()
     # Extract potential symbol names from the query (CamelCase, snake_case, or dotted)
     query_tokens = re.findall(r'[a-zA-Z_][a-zA-Z0-9_\.]*', query)
-    search_terms = set(hints or []) | set(query_tokens)
+    search_terms = {t.strip().lower() for t in (set(hints or []) | set(query_tokens)) if t and t.strip()}
+
+    # Build file lookup once so we can do high-priority exact filename targeting.
+    file_to_nodes = defaultdict(set)
+    base_to_nodes = defaultdict(set)
+    for node_id, node_data in active_graph.items():
+        file_path = (node_data.get('file', '') or '').strip()
+        if not file_path:
+            continue
+        file_lower = file_path.lower()
+        file_name = os.path.basename(file_lower)
+        base_name, _ = os.path.splitext(file_name)
+        file_to_nodes[file_lower].add(node_id)
+        file_to_nodes[file_name].add(node_id)
+        base_to_nodes[base_name].add(node_id)
+
+    # TIER 0: File-aware retrieval (must-fetch all symbols in explicitly named files).
+    for term in search_terms:
+        term_lower = term.lower()
+        if term_lower in file_to_nodes:
+            file_targets.update(file_to_nodes[term_lower])
+        if term_lower in base_to_nodes:
+            file_targets.update(base_to_nodes[term_lower])
+
+    if file_targets:
+        targets.update(file_targets)
 
     for node_id, node_data in active_graph.items():
         symbol_name = node_data.get('symbol', {}).get('name', '')
         if not symbol_name: continue
 
         for term in search_terms:
+            if term in {'what', 'is', 'in', 'the', 'a', 'an', 'show', 'file'}:
+                continue
             # TIER 1: Exact Match (Highest Priority)
-            if symbol_name == term:
+            if symbol_name.lower() == term:
                 targets.add(node_id)
             # TIER 2: Namespace/Script Match
-            elif symbol_name.endswith(f".{term}") or term in node_data.get('file', ''):
+            elif symbol_name.lower().endswith(f".{term}") or term in node_data.get('file', '').lower():
                 targets.add(node_id)
     return targets
 
 
-def _extract_file_mentions(text: str) -> Set[str]:
-    """Extract likely file references from query text (e.g., app.py, src/main.ts)."""
-    if not text:
-        return set()
-    matches = re.findall(r"(?:[\w\-./]+\.)[A-Za-z0-9]{1,8}", text)
-    normalized = set()
-    for m in matches:
-        cleaned = m.strip("`\"'()[]{}.,:;!? ").replace("\\", "/")
-        if cleaned and "." in cleaned:
-            normalized.add(cleaned)
-    return normalized
+def _generate_project_structure_map(active_graph: Dict, max_entries: int = 800) -> str:
+    """Generate a compact tree-style project map from graph file paths."""
+    file_paths = sorted({(n.get('file') or '').strip() for n in active_graph.values() if n.get('file')})
+    if not file_paths:
+        return "(No indexed file paths available)"
 
+    tree = {}
+    for path in file_paths[:max_entries]:
+        parts = [p for p in path.split('/') if p]
+        cursor = tree
+        for idx, part in enumerate(parts):
+            is_leaf = idx == len(parts) - 1
+            cursor = cursor.setdefault(part, {} if not is_leaf else None)
 
-def _resolve_explicit_context_request(
-    query: str,
-    hints: List[str],
-    active_graph: Dict[str, Dict[str, Any]]
-) -> Dict[str, Any]:
-    """
-    Detect explicit file/function requests so retrieval can pass the exact requested scope.
-    - File question -> include entire file content.
-    - Function question -> include matched function(s) and path metadata.
-    """
-    q = (query or "").lower()
-    hint_set = set(hints or [])
+    lines = []
 
-    mentioned_files = _extract_file_mentions(query) | {
-        h for h in hint_set if "." in h and ("/" in h or h.split(".")[-1].isalnum())
-    }
+    def _walk(node: Dict, prefix: str = ""):
+        keys = sorted(node.keys())
+        for i, key in enumerate(keys):
+            is_last = i == len(keys) - 1
+            branch = "└── " if is_last else "├── "
+            lines.append(f"{prefix}{branch}{key}")
+            child = node[key]
+            if isinstance(child, dict):
+                _walk(child, prefix + ("    " if is_last else "│   "))
 
-    file_request_markers = [
-        "entire file", "whole file", "full file", "complete file", "what is there in",
-        "show me", "contents of", "content of"
-    ]
-    is_file_request = bool(mentioned_files) and any(marker in q for marker in file_request_markers)
-
-    matched_files = set()
-    for mention in mentioned_files:
-        for node in active_graph.values():
-            node_file = (node.get("file") or "").replace("\\", "/")
-            if node_file == mention or node_file.endswith(f"/{mention}") or node_file.endswith(mention):
-                matched_files.add(node_file)
-
-    if is_file_request and matched_files:
-        return {"mode": "file", "files": matched_files}
-
-    function_request_markers = [" function", "method", "what does", "how does", "explain ", "do?"]
-    looks_like_function_question = any(m in q for m in function_request_markers)
-
-    if looks_like_function_question:
-        direct_hits = _extract_specific_targets(query, hints or [], active_graph)
-        function_hits = {
-            node_id for node_id in direct_hits
-            if active_graph.get(node_id, {}).get("type") in {"function", "method"}
-        }
-        if function_hits:
-            return {"mode": "function", "nodes": function_hits}
-
-    return {"mode": "default"}
+    _walk(tree)
+    if len(file_paths) > max_entries:
+        lines.append(f"... ({len(file_paths) - max_entries} more files omitted)")
+    return "\n".join(lines)
 
 def _node_expansion_priority(
     query: str,
@@ -3918,7 +4139,7 @@ async def selector_agent_enhanced(
         if mem_nodes:
             print("    🧠 Reusing memory-augmented retrieval hints")
             LAST_SELECTOR_NODES = list(mem_nodes)
-            return build_context_with_budget(mem_nodes, active_graph, target_repo)
+            return build_context_with_budget(mem_nodes, active_graph, target_repo, user_query=technical_query)
 
     explicit_request = _resolve_explicit_context_request(technical_query, hints or [], active_graph)
     if explicit_request.get("mode") == "file":
@@ -3949,21 +4170,28 @@ async def selector_agent_enhanced(
             return _get_blast_radius(next(iter(specific_seeds)), active_graph, max_depth=3)
 
     selected_nodes = set()
+    anchor_ids = set()
     extra_context = []
+    if active_graph:
+        structure_map = _generate_project_structure_map(active_graph)
+        extra_context.append(f"=== PROJECT STRUCTURE MAP ===\n\n{structure_map}")
+        extra_context.append(_build_navigation_index(active_graph, summarizer))
     explanation_weight_mode = query_type == "HIGH_LEVEL" or bool(re.search(r"explain|how\s+.*works|architecture", technical_query, re.IGNORECASE))
-    
+
     # --- STRATEGY 0: DIRECT SYMBOL LOOKUP (Corrected) ---
     if active_graph:
         direct_hits = _extract_specific_targets(technical_query, hints or [], active_graph)
         if direct_hits:
             print(f"    🎯 Direct Symbol Hit: Found {len(direct_hits)} matches.")
+            anchor_ids.update(direct_hits)
             # If specifically asked for these, return immediately
             if query_type == "SPECIFIC":
                  return build_context_with_budget(
                     _priority_graph_traverse(direct_hits, active_graph, technical_query, max_depth=1), 
                     active_graph, 
                     target_repo,
-                    include_path_metadata=True
+                    anchor_ids=anchor_ids,
+                    user_query=technical_query
                 )
             # Otherwise, add to selection and continue
             seed_nodes = _priority_graph_traverse(direct_hits, active_graph, technical_query, max_depth=1)
@@ -3973,9 +4201,16 @@ async def selector_agent_enhanced(
     if query_type == "IMPACT" or "remove" in technical_query.lower():
         anchor_nodes = _extract_specific_targets(technical_query, hints, active_graph)
         if anchor_nodes:
+            anchor_ids.update(anchor_nodes)
             # 1. Provide the Tree Map
-            extra_context.append(_build_impact_tree_text(anchor_nodes, active_graph))
-            # 2. Grab the actual code for the anchors and their immediate callers
+            extra_context.extend(_build_impact_tree_text(anchor_nodes, active_graph))
+            # 2. Provide structural blast radius summary
+            blast_radius_chunks = []
+            for anchor in list(anchor_nodes)[:3]:
+                blast_radius_chunks.extend(_get_blast_radius(anchor, active_graph, max_depth=3))
+            if blast_radius_chunks:
+                extra_context.append("=== STRUCTURAL BLAST RADIUS ===\n\n" + "\n\n".join(blast_radius_chunks))
+            # 3. Grab the actual code for the anchors and their immediate callers
             selected_nodes.update(anchor_nodes)
             selected_nodes.update(_priority_graph_traverse(anchor_nodes, active_graph, technical_query, max_depth=2, direction="callers"))
     
@@ -4046,7 +4281,8 @@ async def selector_agent_enhanced(
                             seed_scores[full_id] = max(seed_scores.get(full_id, 0.0), store.last_scores[result_id])
         
         if not seed_nodes:
-            seed_nodes = await llm_seed_selection(technical_query, active_graph)
+            selector_overview = "\n".join(extra_context[:3])
+            seed_nodes = await llm_seed_selection(technical_query, active_graph, selector_overview)
             
         depth = 2 if explanation_weight_mode else (3 if query_type == "FUNCTIONAL_AREA" else MAX_RECURSION_DEPTH)
         selected_nodes.update(_priority_graph_traverse(
@@ -4074,16 +4310,16 @@ async def selector_agent_enhanced(
         selected_nodes.update(path_nodes)
 
     LAST_SELECTOR_NODES = list(selected_nodes)
-    include_path_metadata = query_type == "SPECIFIC" or bool(re.search(r"function|method|file", technical_query, re.IGNORECASE))
     context_strings = build_context_with_budget(
         selected_nodes,
         active_graph,
         target_repo,
-        include_path_metadata=include_path_metadata
+        anchor_ids=anchor_ids,
+        user_query=technical_query
     )
     return extra_context + context_strings
 
-async def llm_seed_selection(query: str, active_graph: Dict) -> Set[str]:
+async def llm_seed_selection(query: str, active_graph: Dict, selector_overview: str = "") -> Set[str]:
     """Fallback LLM-based seed selection."""
     keys = list(active_graph.keys())[:800]
     
@@ -4100,9 +4336,14 @@ async def llm_seed_selection(query: str, active_graph: Dict) -> Set[str]:
 You are a Code Navigator.
 Query: "{query}"
 
+Project/File Overview:
+{selector_overview or '(not available)'}
+
 Available Nodes:
 {menu_str}
 
+Each node includes a COMMENT that describes what it does.
+Prioritize nodes whose comment and file placement best match the query intent.
 TASK: Select 3-10 STARTING NODES (IDs) most relevant to the query.
 Return JSON: {{"seed_nodes": ["node_id_1", "node_id_2"]}}
 """
@@ -4123,8 +4364,8 @@ def build_context_with_budget(
     selected_nodes: Set[str],
     active_graph: Dict,
     target_repo: str,
-    file_scope: Optional[Set[str]] = None,
-    include_path_metadata: bool = False
+    anchor_ids: Optional[Set[str]] = None,
+    user_query: str = ""
 ) -> List[str]:
     """Build context strings from selected nodes; can force full-file inclusion for explicit file requests."""
 
@@ -4178,7 +4419,7 @@ def build_context_with_budget(
         if include_path_metadata:
             block += f"### PATH_METADATA: selected_file={fname}\n"
 
-        block += render_full_nodes(data['globals'], data['nodes'])
+        block += reconstruct_file_slice(data['globals'], data['nodes'], anchor_ids=anchor_ids or set(), user_query=user_query)
         block += "\n\n"
         context_blocks.append(block)
 
@@ -4189,16 +4430,21 @@ async def llm_assess_context(user_query: str, context_strings: List[str]) -> Dic
     """Assess whether current retrieved context is sufficient to answer."""
     preview = "\n\n".join(context_strings[:4])[:6000]
     prompt = f"""
-You are a retrieval planner for a code reasoning system.
+You are a strict retrieval sufficiency judge for code reasoning.
 User query: {user_query}
 Current context preview:
 {preview}
+
+Rules:
+- If the answer depends on implementation details that seem hidden, truncated, or missing, return NEED_MORE_CONTEXT.
+- If relevant anchor/target files are not fully visible, return NEED_MORE_CONTEXT.
+- Only return ANSWERABLE when the current context is sufficient to answer with concrete code-grounded detail.
 
 Return strict JSON with:
 {{
   "status": "ANSWERABLE" | "NEED_MORE_CONTEXT",
   "missing_info_query": "targeted follow-up query if more context is needed",
-  "reason": "short reason"
+  "reason": "explicitly mention missing/hidden code when applicable"
 }}
 """
     try:
@@ -4292,6 +4538,8 @@ def compress_context_strings(context_strings: List[str], token_budget: int = CON
     return truncate_to_token_budget(compressed, token_budget)
 
 
+
+
 # --- Reframer ---
 
 async def reframer_agent(user_query: str, chat_history: List[Dict], available_repos: List[str]) -> Dict[str, Any]:
@@ -4375,7 +4623,7 @@ async def answering_agent(user_query: str, context_strings: List[str]) -> str:
     print(f"   📊 Context size: {context_tokens} tokens")
     
     messages = [
-        {"role": "system", "content": "You are a principal software architect and senior developer. Answer strictly from the provided Code Context. Prefer precise, technical explanations. When discussing a function, include the function name and file path. If the context includes PATH_METADATA lines, use them explicitly."},
+        {"role": "system", "content": "You are the Lead Architect for this codebase. You have high-fidelity context access. Analyze deeply, prioritize correctness over brevity, and ground every claim in the provided Code Context with specific file-level references."},
         {"role": "user", "content": f"Query: {user_query}\n\nCode Context:\n{full_context}"}
     ]
     
@@ -4528,6 +4776,7 @@ async def main():
             if query.lower() in ['exit', 'quit']:
                 break
             
+
             reframer_res = await reframer_agent(query, chat_history, available_repos)
             
             answer = await autonomous_answering_loop(
