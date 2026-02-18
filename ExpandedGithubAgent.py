@@ -4079,6 +4079,59 @@ def _find_shortest_path_nodes(active_graph: Dict[str, Dict], source_candidates: 
     return set(best_path or [])
 
 
+def _resolve_explicit_context_request(
+    technical_query: str,
+    hints: List[str],
+    active_graph: Dict[str, Dict]
+) -> Dict[str, Any]:
+    """Detect explicit file/function requests from the user query and hints."""
+    query_text = " ".join([technical_query or "", *(hints or [])])
+    lowered = query_text.lower()
+
+    file_patterns = [
+        r"([\w./\\-]+\.[a-z0-9]{1,10})",
+        r"`([^`]+\.[a-z0-9]{1,10})`",
+        r"'([^']+\.[a-z0-9]{1,10})'",
+        r'"([^"]+\.[a-z0-9]{1,10})"',
+    ]
+    file_candidates: Set[str] = set()
+    available_files = {str(node.get("file", "")) for node in active_graph.values() if node.get("file")}
+
+    for pattern in file_patterns:
+        for raw_match in re.findall(pattern, query_text, flags=re.IGNORECASE):
+            candidate = raw_match.strip().replace("\\", "/")
+            if not candidate:
+                continue
+            if candidate in available_files:
+                file_candidates.add(candidate)
+                continue
+
+            basename = os.path.basename(candidate)
+            basename_matches = {f for f in available_files if os.path.basename(f) == basename}
+            if len(basename_matches) == 1:
+                file_candidates.update(basename_matches)
+
+    if file_candidates and any(tok in lowered for tok in ["file", "files", "in ", "inside", "from", "show"]):
+        return {"mode": "file", "files": file_candidates, "nodes": set()}
+
+    explicit_nodes: Set[str] = set()
+    symbol_tokens = set(re.findall(r"[A-Za-z_][A-Za-z0-9_]{2,}", query_text))
+    for node_id, node in active_graph.items():
+        symbol = node.get("symbol", {})
+        name = symbol.get("name", "")
+        if not name:
+            continue
+
+        normalized_name = name.split(".")[-1]
+        if normalized_name in symbol_tokens or name in symbol_tokens:
+            explicit_nodes.add(node_id)
+
+    if explicit_nodes and any(tok in lowered for tok in ["function", "method", "class", "impl", "implementation"]):
+        return {"mode": "function", "files": set(), "nodes": explicit_nodes}
+
+    return {"mode": "none", "files": set(), "nodes": set()}
+
+
 async def selector_agent_enhanced(
     target_repo: str,
     technical_query: str,
@@ -4118,6 +4171,10 @@ async def selector_agent_enhanced(
     
     if not active_graph and query_type != "HIGH_LEVEL":
         return []
+
+    selected_nodes = set()
+    anchor_ids = set()
+    extra_context = []
 
     # --- 2. Calculate Dynamic Limits ---
     # Filter for code nodes only (ignore folders/external libs for counting)
@@ -4169,9 +4226,6 @@ async def selector_agent_enhanced(
             LAST_SELECTOR_NODES = list(specific_seeds)
             return _get_blast_radius(next(iter(specific_seeds)), active_graph, max_depth=3)
 
-    selected_nodes = set()
-    anchor_ids = set()
-    extra_context = []
     if active_graph:
         structure_map = _generate_project_structure_map(active_graph)
         extra_context.append(f"=== PROJECT STRUCTURE MAP ===\n\n{structure_map}")
