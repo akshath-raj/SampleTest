@@ -2629,6 +2629,211 @@ Inherits: {', '.join(data.get('bases', []))}
                 self.embedding_cache = data.get('embedding_cache', {"intent": {}, "code": {}, "structure": {}})
 
 
+
+def _extract_event_signals(code: str) -> Dict[str, List[str]]:
+    """Extract event names from common emit/listen patterns."""
+    text = code or ""
+    emit_patterns = [
+        r'\bemit\s*\(\s*["\']([^"\']+)["\']',
+        r'\bdispatch(?:Event)?\s*\(\s*["\']([^"\']+)["\']',
+        r'\bpublish\s*\(\s*["\']([^"\']+)["\']',
+        r'\btrigger\s*\(\s*["\']([^"\']+)["\']'
+    ]
+    listen_patterns = [
+        r'\bon\s*\(\s*["\']([^"\']+)["\']',
+        r'\blisten\s*\(\s*["\']([^"\']+)["\']',
+        r'\bsubscribe\s*\(\s*["\']([^"\']+)["\']',
+        r'\baddEventListener\s*\(\s*["\']([^"\']+)["\']'
+    ]
+
+    emits, listens = set(), set()
+    for pattern in emit_patterns:
+        emits.update(re.findall(pattern, text, flags=re.IGNORECASE))
+    for pattern in listen_patterns:
+        listens.update(re.findall(pattern, text, flags=re.IGNORECASE))
+
+    return {"emits": sorted(emits), "listens": sorted(listens)}
+
+
+def _normalize_type_name(type_name: str) -> str:
+    if not type_name:
+        return ""
+    cleaned = re.sub(r"[<>{}\[\],|]", " ", type_name)
+    tokens = [t.strip().split('.')[-1] for t in cleaned.split() if t.strip()]
+    return tokens[0] if tokens else ""
+
+
+def _is_test_file(path: str) -> bool:
+    p = (path or "").replace('\\', '/').lower()
+    base = os.path.basename(p)
+    return (
+        '/test/' in p
+        or '/tests/' in p
+        or '/__tests__/' in p
+        or base.startswith('test_')
+        or base.endswith('_test.py')
+        or base.endswith('.spec.js')
+        or base.endswith('.spec.ts')
+        or base.endswith('.test.js')
+        or base.endswith('.test.ts')
+    )
+
+
+def _heuristic_test_target(path: str) -> str:
+    base = os.path.splitext(os.path.basename(path or ""))[0]
+    if base.startswith('test_'):
+        return base[5:]
+    if base.endswith('_test'):
+        return base[:-5]
+    if base.endswith('.spec'):
+        return base[:-5]
+    if base.endswith('.test'):
+        return base[:-5]
+    return base
+
+
+def _apply_implicit_dependency_heuristics(graph: Dict[str, Dict]):
+    """Add weak/dotted dependency edges for interfaces and events."""
+    classes_by_name = defaultdict(list)
+    interface_impls = defaultdict(set)
+    emitters = defaultdict(set)
+    listeners = defaultdict(set)
+
+    for nid, node in graph.items():
+        if node.get('type') == 'class':
+            cls_name = node.get('symbol', {}).get('name', '').split('.')[-1]
+            if cls_name:
+                classes_by_name[cls_name].append(nid)
+        for base in node.get('bases', []) or []:
+            base_name = str(base).split('.')[-1]
+            if base_name and node.get('type') == 'class':
+                interface_impls[base_name].add(nid)
+
+        signals = node.get('event_signals', {}) or {}
+        for ev in signals.get('emits', []) or []:
+            emitters[ev].add(nid)
+        for ev in signals.get('listens', []) or []:
+            listeners[ev].add(nid)
+
+    for nid, node in graph.items():
+        weak_deps = set(node.get('weak_dependencies', []))
+        evidence = node.get('implicit_edge_evidence', []) or []
+
+        # Interface/polymorphism matching
+        for at in node.get('arg_types', []) or []:
+            tname = _normalize_type_name(str(at))
+            if not tname:
+                continue
+            for impl_id in interface_impls.get(tname, set()):
+                if impl_id != nid:
+                    weak_deps.add(impl_id)
+                    evidence.append({"kind": "interface_dispatch", "interface": tname, "target": impl_id})
+
+        code = node.get('code', '') or ''
+        for var_name, var_type in re.findall(r"([a-zA-Z_][a-zA-Z0-9_]*)\s*:\s*([a-zA-Z_][a-zA-Z0-9_\.]*)", code):
+            type_name = var_type.split('.')[-1]
+            for impl_id in interface_impls.get(type_name, set()):
+                if impl_id != nid and re.search(rf"\b{re.escape(var_name)}\s*\.", code):
+                    weak_deps.add(impl_id)
+                    evidence.append({"kind": "interface_dispatch", "interface": type_name, "target": impl_id, "via": var_name})
+
+        node['weak_dependencies'] = sorted(weak_deps)
+        node['implicit_edge_evidence'] = evidence
+
+    # Event emitter/listener links
+    for event_name, emit_nodes in emitters.items():
+        listen_nodes = listeners.get(event_name, set())
+        if not listen_nodes:
+            continue
+        for emit_id in emit_nodes:
+            emitter = graph.get(emit_id)
+            if not emitter:
+                continue
+            weak = set(emitter.get('weak_dependencies', []))
+            ev_edges = emitter.get('event_dependencies', []) or []
+            for listen_id in listen_nodes:
+                if listen_id == emit_id:
+                    continue
+                weak.add(listen_id)
+                ev_edges.append({"event": event_name, "listener": listen_id, "edge_type": "event_signal"})
+            emitter['weak_dependencies'] = sorted(weak)
+            emitter['event_dependencies'] = ev_edges
+
+
+def _apply_test_verifier_links(graph: Dict[str, Dict]):
+    """Map production nodes to test/verifier nodes."""
+    test_nodes = [nid for nid, n in graph.items() if _is_test_file(n.get('file', ''))]
+    prod_nodes = [nid for nid, n in graph.items() if nid not in test_nodes and n.get('type') != 'folder']
+
+    symbol_to_prod = defaultdict(set)
+    by_file_stem = defaultdict(set)
+    for nid in prod_nodes:
+        node = graph[nid]
+        sym = node.get('symbol', {}).get('name', '').split('.')[-1]
+        if sym:
+            symbol_to_prod[sym].add(nid)
+        stem = os.path.splitext(os.path.basename(node.get('file', '')))[0]
+        if stem:
+            by_file_stem[stem].add(nid)
+
+    for test_id in test_nodes:
+        tnode = graph[test_id]
+        targets = set()
+
+        # Heuristic filename mapping
+        guessed = _heuristic_test_target(tnode.get('file', ''))
+        targets.update(by_file_stem.get(guessed, set()))
+
+        # Import/call matching
+        blob = "\n".join([tnode.get('globals', ''), tnode.get('code', ''), " ".join(tnode.get('calls', []))])
+        for sym, prod_ids in symbol_to_prod.items():
+            if sym and re.search(rf"\b{re.escape(sym)}\b", blob):
+                targets.update(prod_ids)
+
+        tnode['verifies'] = sorted(targets)
+        tnode['is_test_node'] = True
+
+        for pid in targets:
+            pnode = graph.get(pid)
+            if not pnode:
+                continue
+            verifiers = set(pnode.get('verified_by_tests', []))
+            verifiers.add(test_id)
+            pnode['verified_by_tests'] = sorted(verifiers)
+
+
+def _mark_dead_code_candidates(graph: Dict[str, Dict]):
+    """Mark nodes that have no incoming callers and are not entry points."""
+    entrypoint_regex = re.compile(r"(main\.|__main__|app\.|index\.|server\.|cli|export)", re.IGNORECASE)
+    dead_count = 0
+
+    for nid, node in graph.items():
+        if node.get('type') in {'folder', 'external_library', 'package_dependencies'}:
+            node['dead_code_candidate'] = False
+            continue
+
+        incoming = len(node.get('callers', [])) + len(node.get('verified_by_tests', []))
+        incoming += sum(1 for other in graph.values() if nid in (other.get('weak_dependencies', []) or []))
+
+        sym = node.get('symbol', {}).get('name', '')
+        fpath = node.get('file', '')
+        is_entry = bool(entrypoint_regex.search(sym) or entrypoint_regex.search(fpath))
+        is_publicish = sym and ('.' not in sym) and node.get('type') in {'function', 'class', 'module'}
+
+        candidate = incoming == 0 and not is_entry and not is_publicish and not _is_test_file(fpath)
+        node['dead_code_candidate'] = candidate
+        if candidate:
+            dead_count += 1
+
+    graph['__dead_code_summary__'] = {
+        "repo": next(iter(graph.values())).get('repo', '') if graph else '',
+        "type": "analysis",
+        "symbol": {"name": "dead_code_summary"},
+        "file": "<analysis>",
+        "dead_code_candidate_count": dead_count
+    }
+
+
 # --- Graph Building ---
 
 async def build_single_repo_graph(
@@ -2769,7 +2974,9 @@ async def build_single_repo_graph(
                 "code": node['code'],
                 "type": node['type'],
                 "globals": file_globals.get(filename, ""),
+                "calls": node.get('calls', []),
                 "dependencies": list(set(valid_deps)),
+                "weak_dependencies": [],
                 "inherits": [],
                 "callers": [],
                 "api_route": node.get('api_route'),
@@ -2793,6 +3000,9 @@ async def build_single_repo_graph(
                 "dfg": node_dfg,
                 "cfg": node_cfg,
                 "type_info": node_types,
+                "event_signals": _extract_event_signals(node['code']),
+                "event_dependencies": [],
+                "implicit_edge_evidence": [],
                 "param_bindings": _extract_param_bindings(node['code']) if filename.endswith('.py') else {},
                 "symbolic_execution": _symbolic_execution_preview(node['code']) if filename.endswith('.py') else {"constraints": [], "symbols": []},
                 "test_inputs": _generate_boundary_test_inputs(node.get('arg_names', []), node.get('arg_types', [])),
@@ -2812,7 +3022,9 @@ async def build_single_repo_graph(
                 "code": files_data[filename]['content'][:2000],
                 "type": "module",
                 "globals": file_globals.get(filename, ""),
+                "calls": [],
                 "dependencies": [],
+                "weak_dependencies": [],
                 "inherits": [],
                 "callers": [],
                 "api_route": None,
@@ -2836,6 +3048,9 @@ async def build_single_repo_graph(
                 "dfg": {"defs": {}, "uses": {}, "edges": [], "return_flows": [], "field_dependencies": {}, "taint": {"sources": [], "sinks": [], "sanitizers": [], "vulnerabilities": []}},
                 "cfg": {"blocks": [], "edges": []},
                 "type_info": {"type_registry": {}, "interface_links": [], "generic_usages": [], "field_links": {}},
+                "event_signals": _extract_event_signals(files_data[filename]['content']),
+                "event_dependencies": [],
+                "implicit_edge_evidence": [],
                 "param_bindings": {},
                 "security_role": "neutral",
                 "requires_auth": False,
@@ -2853,7 +3068,9 @@ async def build_single_repo_graph(
                 "code": files_data[filename]['content'][:2000],
                 "type": "module",
                 "globals": "",
+                "calls": [],
                 "dependencies": [],
+                "weak_dependencies": [],
                 "inherits": [],
                 "callers": [],
                 "api_route": None,
@@ -2877,6 +3094,9 @@ async def build_single_repo_graph(
                 "dfg": {"defs": {}, "uses": {}, "edges": [], "return_flows": [], "field_dependencies": {}, "taint": {"sources": [], "sinks": [], "sanitizers": [], "vulnerabilities": []}},
                 "cfg": {"blocks": [], "edges": []},
                 "type_info": {"type_registry": {}, "interface_links": [], "generic_usages": [], "field_links": {}},
+                "event_signals": _extract_event_signals(files_data[filename]['content']),
+                "event_dependencies": [],
+                "implicit_edge_evidence": [],
                 "param_bindings": {},
                 "security_role": "neutral",
                 "requires_auth": False,
@@ -2915,7 +3135,9 @@ async def build_single_repo_graph(
             "code": "",
             "type": "folder",
             "globals": "",
+            "calls": [],
             "dependencies": [],
+            "weak_dependencies": [],
             "inherits": [],
             "callers": [],
             "contains": sorted(children),
@@ -2940,6 +3162,9 @@ async def build_single_repo_graph(
             "dfg": {"defs": {}, "uses": {}, "edges": [], "return_flows": [], "field_dependencies": {}, "taint": {"sources": [], "sinks": [], "sanitizers": [], "vulnerabilities": []}},
             "cfg": {"blocks": [], "edges": []},
             "type_info": {"type_registry": {}, "interface_links": [], "generic_usages": [], "field_links": {}},
+            "event_signals": {"emits": [], "listens": []},
+            "event_dependencies": [],
+            "implicit_edge_evidence": [],
             "param_bindings": {},
             "symbolic_execution": {"constraints": [], "symbols": []},
             "test_inputs": [],
@@ -2992,7 +3217,9 @@ async def build_single_repo_graph(
                     "code": f"external library: {lib}",
                     "type": "external_library",
                     "globals": "",
+                    "calls": [],
                     "dependencies": [],
+                    "weak_dependencies": [],
                     "inherits": [],
                     "callers": [],
                     "api_route": None,
@@ -3048,6 +3275,14 @@ async def build_single_repo_graph(
         ndata.setdefault('dfg', {"defs": {}, "uses": {}, "edges": [], "return_flows": [], "field_dependencies": {}, "taint": {"sources": [], "sinks": [], "sanitizers": [], "vulnerabilities": []}})
         ndata.setdefault('cfg', {"blocks": [], "edges": []})
         ndata.setdefault('type_info', {"type_registry": {}, "interface_links": [], "generic_usages": [], "field_links": {}})
+        ndata.setdefault('calls', [])
+        ndata.setdefault('weak_dependencies', [])
+        ndata.setdefault('event_signals', _extract_event_signals(ndata.get('code', '')))
+        ndata.setdefault('event_dependencies', [])
+        ndata.setdefault('implicit_edge_evidence', [])
+        ndata.setdefault('verified_by_tests', [])
+        ndata.setdefault('verifies', [])
+        ndata.setdefault('is_test_node', _is_test_file(ndata.get('file', '')))
         ndata.setdefault('param_bindings', {})
         ndata.setdefault('previous_identity', None)
         ndata.setdefault('symbolic_execution', {"constraints": [], "symbols": []})
@@ -3055,6 +3290,10 @@ async def build_single_repo_graph(
         ndata['security_role'] = _infer_security_role(ndata)
         if ndata.get('security_role') == 'auth_boundary':
             ndata['requires_auth'] = True
+
+    _apply_implicit_dependency_heuristics(graph)
+    _apply_test_verifier_links(graph)
+    _mark_dead_code_candidates(graph)
 
     # Add package-level dependency graph node.
     pkg_meta = _build_package_dependency_metadata(files_data)
@@ -3066,7 +3305,9 @@ async def build_single_repo_graph(
         "code": json.dumps(pkg_meta, ensure_ascii=False)[:4000],
         "type": "package_dependencies",
         "globals": "",
+        "calls": [],
         "dependencies": [],
+        "weak_dependencies": [],
         "inherits": [],
         "callers": [],
         "api_route": None,
@@ -3090,6 +3331,9 @@ async def build_single_repo_graph(
         "dfg": {"defs": {}, "uses": {}, "edges": [], "return_flows": [], "field_dependencies": {}, "taint": {"sources": [], "sinks": [], "sanitizers": [], "vulnerabilities": []}},
         "cfg": {"blocks": [], "edges": []},
         "type_info": {"type_registry": {}, "interface_links": [], "generic_usages": [], "field_links": {}},
+        "event_signals": {"emits": [], "listens": []},
+        "event_dependencies": [],
+        "implicit_edge_evidence": [],
         "param_bindings": {},
         "security_role": "neutral",
         "requires_auth": False,
