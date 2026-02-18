@@ -4055,8 +4055,11 @@ def build_context_with_budget(
         files_context[display_name]["globals"] = node.get('globals', '')
         files_context[display_name]["nodes"].append(node)
 
+    # Keep explicit selections first so full function bodies are retained under budget.
+    anchor_ids = set(selected_nodes)
     context_blocks = []
     for fname, data in files_context.items():
+        data['nodes'].sort(key=lambda n: 0 if (n.get('global_id') in anchor_ids or n.get('node_id') in anchor_ids) else 1)
         block = f"############################################################\n"
         block += f"### FILE: {fname}\n"
         block += f"### Selected symbols in this block: {len(data['nodes'])}\n"
