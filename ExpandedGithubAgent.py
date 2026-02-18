@@ -818,23 +818,14 @@ def _extract_python_semantic_metadata(code: str) -> Dict[str, Any]:
     return meta
 
 
-def reconstruct_file_slice(file_globals: str, nodes: List[Dict[str, Any]], anchor_ids: Set[str] = None) -> str:
-    """Build a file slice: full code for anchor nodes, skeletal context for non-anchors."""
+def render_full_nodes(file_globals: str, nodes: List[Dict[str, Any]]) -> str:
+    """Render full code for all selected nodes."""
     block = f"--- FILE GLOBALS ---\n{file_globals}\n" if file_globals else ""
-    anchor_ids = anchor_ids or set()
 
     for node in nodes:
         name = node.get('symbol', {}).get('name', 'unknown')
-        is_anchor = node.get('global_id') in anchor_ids or node.get('node_id') in anchor_ids
-
-        if is_anchor:
-            block += f"\n// FULL SYMBOL: {name}\n{node.get('code', '')}\n"
-        else:
-            # SKELETAL VIEW: Just the signature and docstring
-            doc = node.get('docstring', '').split('\n')[0]
-            block += f"\n// CONTEXT ONLY: {node.get('type')} {name}\n// Doc: {doc}\n// [Implementation hidden to save tokens]\n"
+        block += f"\n// SYMBOL: {name}\n{node.get('code', '')}\n"
     return block
-
 
 def compute_file_content_hash(content: str) -> str:
     return hashlib.md5(content.encode('utf-8', errors='ignore')).hexdigest()
@@ -4044,21 +4035,11 @@ def build_context_with_budget(
     active_graph: Dict,
     target_repo: str
 ) -> List[str]:
-    """Build context strings with token budgeting using dynamic code slicing."""
+    """Build context strings from selected nodes using full code for each selected symbol."""
 
     files_context = defaultdict(lambda: {"globals": "", "nodes": []})
 
-    # Pull immediate dependencies as slice support nodes (program slicing).
-    expanded_nodes = set(selected_nodes)
-    for node_id in list(selected_nodes):
-        node = active_graph.get(node_id)
-        if not node:
-            continue
-        for dep_id in node.get('dependencies', [])[:5]:
-            if dep_id in active_graph:
-                expanded_nodes.add(dep_id)
-
-    for node_id in expanded_nodes:
+    for node_id in selected_nodes:
         if node_id not in active_graph:
             continue
 
@@ -4081,16 +4062,15 @@ def build_context_with_budget(
         data['nodes'].sort(key=lambda n: 0 if (n.get('global_id') in anchor_ids or n.get('node_id') in anchor_ids) else 1)
         block = f"############################################################\n"
         block += f"### FILE: {fname}\n"
-        block += f"### Sliced symbols in this block: {len(data['nodes'])}\n"
+        block += f"### Selected symbols in this block: {len(data['nodes'])}\n"
         block += f"############################################################\n\n"
 
-        block += reconstruct_file_slice(data['globals'], data['nodes'], anchor_ids=anchor_ids)
+        block += render_full_nodes(data['globals'], data['nodes'])
         block += "\n\n"
         context_blocks.append(block)
 
     budgeted_context = truncate_to_token_budget(context_blocks, MAX_CONTEXT_TOKENS)
     return budgeted_context
-
 
 async def llm_assess_context(user_query: str, context_strings: List[str]) -> Dict[str, Any]:
     """Assess whether current retrieved context is sufficient to answer."""
@@ -4169,7 +4149,7 @@ async def autonomous_answering_loop(
     return "I tried multiple retrieval passes but could not find enough evidence to answer confidently."
 
 def compress_context_strings(context_strings: List[str], token_budget: int = CONTEXT_COMPRESSION_TRIGGER_TOKENS) -> List[str]:
-    """Compress context opportunistically by removing repetitive globals and oversize slices."""
+    """Compress context opportunistically by removing repetitive globals and oversize blocks."""
     if not context_strings:
         return context_strings
 
