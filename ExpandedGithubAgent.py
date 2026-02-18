@@ -3583,6 +3583,67 @@ def _extract_specific_targets(query: str, hints: List[str], active_graph: Dict) 
                 targets.add(node_id)
     return targets
 
+
+def _extract_file_mentions(text: str) -> Set[str]:
+    """Extract likely file references from query text (e.g., app.py, src/main.ts)."""
+    if not text:
+        return set()
+    matches = re.findall(r"(?:[\w\-./]+\.)[A-Za-z0-9]{1,8}", text)
+    normalized = set()
+    for m in matches:
+        cleaned = m.strip("`\"'()[]{}.,:;!? ").replace("\\", "/")
+        if cleaned and "." in cleaned:
+            normalized.add(cleaned)
+    return normalized
+
+
+def _resolve_explicit_context_request(
+    query: str,
+    hints: List[str],
+    active_graph: Dict[str, Dict[str, Any]]
+) -> Dict[str, Any]:
+    """
+    Detect explicit file/function requests so retrieval can pass the exact requested scope.
+    - File question -> include entire file content.
+    - Function question -> include matched function(s) and path metadata.
+    """
+    q = (query or "").lower()
+    hint_set = set(hints or [])
+
+    mentioned_files = _extract_file_mentions(query) | {
+        h for h in hint_set if "." in h and ("/" in h or h.split(".")[-1].isalnum())
+    }
+
+    file_request_markers = [
+        "entire file", "whole file", "full file", "complete file", "what is there in",
+        "show me", "contents of", "content of"
+    ]
+    is_file_request = bool(mentioned_files) and any(marker in q for marker in file_request_markers)
+
+    matched_files = set()
+    for mention in mentioned_files:
+        for node in active_graph.values():
+            node_file = (node.get("file") or "").replace("\\", "/")
+            if node_file == mention or node_file.endswith(f"/{mention}") or node_file.endswith(mention):
+                matched_files.add(node_file)
+
+    if is_file_request and matched_files:
+        return {"mode": "file", "files": matched_files}
+
+    function_request_markers = [" function", "method", "what does", "how does", "explain ", "do?"]
+    looks_like_function_question = any(m in q for m in function_request_markers)
+
+    if looks_like_function_question:
+        direct_hits = _extract_specific_targets(query, hints or [], active_graph)
+        function_hits = {
+            node_id for node_id in direct_hits
+            if active_graph.get(node_id, {}).get("type") in {"function", "method"}
+        }
+        if function_hits:
+            return {"mode": "function", "nodes": function_hits}
+
+    return {"mode": "default"}
+
 def _node_expansion_priority(
     query: str,
     node: Dict[str, Any],
@@ -3859,6 +3920,27 @@ async def selector_agent_enhanced(
             LAST_SELECTOR_NODES = list(mem_nodes)
             return build_context_with_budget(mem_nodes, active_graph, target_repo)
 
+    explicit_request = _resolve_explicit_context_request(technical_query, hints or [], active_graph)
+    if explicit_request.get("mode") == "file":
+        explicit_files = explicit_request.get("files", set())
+        explicit_nodes = {nid for nid, node in active_graph.items() if node.get('file') in explicit_files}
+        if explicit_nodes:
+            print(f"    📄 Explicit file request detected. Including full file context for {len(explicit_files)} file(s).")
+            LAST_SELECTOR_NODES = list(explicit_nodes)
+            return build_context_with_budget(
+                explicit_nodes,
+                active_graph,
+                target_repo,
+                file_scope=explicit_files,
+                include_path_metadata=True
+            )
+
+    if explicit_request.get("mode") == "function":
+        explicit_func_nodes = set(explicit_request.get("nodes", set()))
+        if explicit_func_nodes:
+            print(f"    🔬 Explicit function request detected. Pinning {len(explicit_func_nodes)} function(s).")
+            selected_nodes.update(explicit_func_nodes)
+
     # --- 4. Impact Analysis (Keep existing) ---
     if query_type == "IMPACT" and active_graph:
         specific_seeds = _extract_specific_targets(technical_query, hints or [], active_graph)
@@ -3880,7 +3962,8 @@ async def selector_agent_enhanced(
                  return build_context_with_budget(
                     _priority_graph_traverse(direct_hits, active_graph, technical_query, max_depth=1), 
                     active_graph, 
-                    target_repo
+                    target_repo,
+                    include_path_metadata=True
                 )
             # Otherwise, add to selection and continue
             seed_nodes = _priority_graph_traverse(direct_hits, active_graph, technical_query, max_depth=1)
@@ -3991,7 +4074,13 @@ async def selector_agent_enhanced(
         selected_nodes.update(path_nodes)
 
     LAST_SELECTOR_NODES = list(selected_nodes)
-    context_strings = build_context_with_budget(selected_nodes, active_graph, target_repo)
+    include_path_metadata = query_type == "SPECIFIC" or bool(re.search(r"function|method|file", technical_query, re.IGNORECASE))
+    context_strings = build_context_with_budget(
+        selected_nodes,
+        active_graph,
+        target_repo,
+        include_path_metadata=include_path_metadata
+    )
     return extra_context + context_strings
 
 async def llm_seed_selection(query: str, active_graph: Dict) -> Set[str]:
@@ -4033,9 +4122,11 @@ Return JSON: {{"seed_nodes": ["node_id_1", "node_id_2"]}}
 def build_context_with_budget(
     selected_nodes: Set[str],
     active_graph: Dict,
-    target_repo: str
+    target_repo: str,
+    file_scope: Optional[Set[str]] = None,
+    include_path_metadata: bool = False
 ) -> List[str]:
-    """Build context strings from selected nodes using full code for each selected symbol."""
+    """Build context strings from selected nodes; can force full-file inclusion for explicit file requests."""
 
     files_context = defaultdict(lambda: {"globals": "", "nodes": []})
 
@@ -4055,6 +4146,26 @@ def build_context_with_budget(
         files_context[display_name]["globals"] = node.get('globals', '')
         files_context[display_name]["nodes"].append(node)
 
+    # If user explicitly requested a file, include all symbols from that file.
+    if file_scope:
+        normalized_scope = {f.replace("\\", "/") for f in file_scope}
+        for _, node in active_graph.items():
+            rel_file_path = (node.get('file') or '').replace("\\", "/")
+            if rel_file_path not in normalized_scope:
+                continue
+
+            repo_name = node.get('repo', '')
+            if target_repo == "ALL":
+                display_name = f"[{repo_name}] {rel_file_path}"
+            else:
+                display_name = rel_file_path
+
+            existing = files_context[display_name]["nodes"]
+            if node not in existing:
+                existing.append(node)
+            if not files_context[display_name]["globals"]:
+                files_context[display_name]["globals"] = node.get('globals', '')
+
     # Keep explicit selections first so full function bodies are retained under budget.
     anchor_ids = set(selected_nodes)
     context_blocks = []
@@ -4064,6 +4175,8 @@ def build_context_with_budget(
         block += f"### FILE: {fname}\n"
         block += f"### Selected symbols in this block: {len(data['nodes'])}\n"
         block += f"############################################################\n\n"
+        if include_path_metadata:
+            block += f"### PATH_METADATA: selected_file={fname}\n"
 
         block += render_full_nodes(data['globals'], data['nodes'])
         block += "\n\n"
@@ -4262,7 +4375,7 @@ async def answering_agent(user_query: str, context_strings: List[str]) -> str:
     print(f"   📊 Context size: {context_tokens} tokens")
     
     messages = [
-        {"role": "system", "content": "You are a senior developer. Answer based strictly on the provided Code Context. Be specific and cite file names when relevant."},
+        {"role": "system", "content": "You are a principal software architect and senior developer. Answer strictly from the provided Code Context. Prefer precise, technical explanations. When discussing a function, include the function name and file path. If the context includes PATH_METADATA lines, use them explicitly."},
         {"role": "user", "content": f"Query: {user_query}\n\nCode Context:\n{full_context}"}
     ]
     
